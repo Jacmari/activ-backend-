@@ -35,7 +35,7 @@ app.post("/plaid/link_token/create", async (req, res) => {
     const response = await client.linkTokenCreate({
       user: { client_user_id: "demo-user" },
       client_name: "ACTIV FINANCE JAMARI",
-      products: ["auth", "transactions"],
+      products: ["transactions"],
       country_codes: ["US"],
       language: "en",
     });
