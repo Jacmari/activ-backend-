@@ -68,7 +68,7 @@ app.post('/plaid/link_token/create', async (req, res) => {
       user: { client_user_id: String(userId) },
       client_name: 'ACTIV FINANCE JAMARI',
       // IMPORTANT: only request what you’re approved for
-      products: ['transactions'],
+      products: ["transactions", "balance"],
       language: 'en',
       country_codes: ['US'],
       // If Plaid asked you to set a redirect_uri for OAuth, add:
