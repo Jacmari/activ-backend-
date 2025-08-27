@@ -1,252 +1,327 @@
-// server.js
-// ACTIV Finance Backend — single-file build (Plaid + Knowledge)
-// Works on Heroku. Requires env vars: PLAID_CLIENT_ID, PLAID_SECRET, (optional) PLAID_ENV=production
-// Optional: /data/books/*.txt (your notes/summaries) for JAMARI knowledge search
+// server.js — ACTIV one-file Plaid backend (Production-ready, no npm deps)
+// Node 18+ (uses built-in fetch). Works on Heroku with your current env vars.
 
-const express = require('express');
-const cors = require('cors');
-const path = require('path');
-const fs = require('fs');
-const fsp = require('fs/promises');
+const http = require('http');
+const url = require('url');
 
-// ------------------------ Plaid setup ------------------------
-const { Configuration, PlaidApi, PlaidEnvironments } = require('plaid');
-
+// ---------- ENV ----------
+const PORT = process.env.PORT || 3000;
 const PLAID_CLIENT_ID = process.env.PLAID_CLIENT_ID || '';
-const PLAID_SECRET     = process.env.PLAID_SECRET || '';
-const PLAID_ENV        = (process.env.PLAID_ENV || 'production').toLowerCase(); // 'production'|'sandbox'|'development'
+const PLAID_SECRET = process.env.PLAID_SECRET || '';
+const PLAID_ENV = (process.env.PLAID_ENV || 'production').toLowerCase();
 
-const plaidConfig = new Configuration({
-  basePath: PlaidEnvironments[PLAID_ENV] || PlaidEnvironments.production,
-  baseOptions: {
+const COUNTRY_CODES = (process.env.PLAID_COUNTRY_CODES || 'US')
+  .split(',').map(s => s.trim().toUpperCase());
+
+// Valid Plaid products (do NOT include "balances" — not a product)
+const VALID_PRODUCTS = new Set([
+  'auth','transactions','identity','assets','investments',
+  'liabilities','income','payment_initiation','transfer','signal','credit_details'
+]);
+
+// Preferred set for your app; we’ll auto-trim anything not enabled
+const PREFERRED_PRODUCTS = ['transactions','auth','identity','liabilities','investments'];
+
+const BASES = {
+  sandbox: 'https://sandbox.plaid.com',
+  development: 'https://development.plaid.com',
+  production: 'https://production.plaid.com',
+};
+const BASE = BASES[PLAID_ENV] || BASES.production;
+
+// ---------- Simple in-memory token store (swap for DB later if needed) ----------
+const tokens = new Map(); // userId -> access_token
+
+// ---------- Helpers ----------
+function cors(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+}
+function json(res, code, obj) {
+  cors(res);
+  res.writeHead(code, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(obj));
+}
+function readJSON(req) {
+  return new Promise((resolve) => {
+    let data = '';
+    req.on('data', chunk => (data += chunk));
+    req.on('end', () => {
+      try { resolve(JSON.parse(data || '{}')); }
+      catch { resolve({}); }
+    });
+  });
+}
+async function plaidPost(path, body) {
+  const r = await fetch(`${BASE}${path}`, {
+    method: 'POST',
     headers: {
+      'Content-Type': 'application/json',
       'PLAID-CLIENT-ID': PLAID_CLIENT_ID,
       'PLAID-SECRET': PLAID_SECRET,
     },
-  },
-});
-const plaid = new PlaidApi(plaidConfig);
-
-// simple in-memory token store (per dyno). For a real app, persist per-user.
-let ACCESS_TOKEN = null;
-
-// ------------------------ Knowledge (inline) ------------------------
-const BOOKS_DIR = path.join(__dirname, 'data', 'books');
-let KNOW_INDEX = []; // [{book, chunk, tokens, tf}]
-let KNOW_STATS = { files: 0, chunks: 0, bytes: 0, indexed: 0 };
-
-function normalize(text) {
-  return String(text || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+    body: JSON.stringify(body),
+  });
+  const text = await r.text();
+  let data;
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+  if (!r.ok) {
+    const err = data || {};
+    err.http_status = r.status;
+    throw err;
+  }
+  return data;
 }
-function tokenize(text) {
-  return normalize(text).split(' ').filter(Boolean);
+function uid() {
+  return (Date.now().toString(36) + Math.random().toString(36).slice(2));
 }
-function tf(tokens) {
-  const m = new Map();
-  for (const t of tokens) m.set(t, (m.get(t) || 0) + 1);
-  return m;
+function cleanProducts(list) {
+  return (list || PREFERRED_PRODUCTS)
+    .map(s => String(s).trim().toLowerCase())
+    .filter(p => VALID_PRODUCTS.has(p));
 }
-function cosine(a, b) {
-  let dot = 0, a2 = 0, b2 = 0;
-  for (const v of a.values()) a2 += v*v;
-  for (const v of b.values()) b2 += v*v;
-  for (const [k, v] of a.entries()) dot += v * (b.get(k) || 0);
-  return dot / ((Math.sqrt(a2) * Math.sqrt(b2)) || 1);
+function parseInvalidProducts(err) {
+  // Plaid often returns text like "invalid product names: [balances, foo]"
+  const m = (err?.error_message || '').match(/\[([^\]]+)\]/);
+  if (!m) return [];
+  return m[1].split(',').map(s => s.trim().toLowerCase());
 }
-function chunkText(text, target = 800, overlap = 120) {
-  const clean = String(text || '').replace(/\r/g, '');
-  const paras = clean.split(/\n{2,}/);
-  const out = [];
-  let buf = '';
-  const push = (s) => { s = s.trim(); if (s) out.push(s); };
-  for (const p of paras) {
-    if ((buf + '\n\n' + p).length <= target) {
-      buf = buf ? buf + '\n\n' + p : p;
-    } else {
-      if (buf) push(buf);
-      if (p.length <= target) {
-        buf = p;
-      } else {
-        let i = 0;
-        while (i < p.length) {
-          push(p.slice(i, i + target));
-          i += target - overlap;
-        }
-        buf = '';
+async function linkTokenCreateSmart(baseReq, prods) {
+  // Try with given products; if INVALID_PRODUCT, remove bad ones and retry.
+  let products = cleanProducts(prods);
+  if (products.length === 0) products = ['transactions'];
+  while (products.length) {
+    try {
+      const body = { ...baseReq, products };
+      const out = await plaidPost('/link/token/create', body);
+      return { ...out, products_used: products };
+    } catch (e) {
+      const code = e?.error_code || e?.error || '';
+      if (code === 'INVALID_PRODUCT') {
+        const bad = new Set(parseInvalidProducts(e));
+        products = products.filter(p => !bad.has(p));
+        if (!products.length) break;
+        continue;
       }
+      // If product not enabled for your account
+      if (code === 'PRODUCTS_NOT_SUPPORTED' || code === 'PRODUCTS_NOT_ENABLED') {
+        // Try again with a minimal viable set
+        products = ['transactions','auth'].filter(p => products.includes(p));
+        if (!products.length) products = ['transactions'];
+        continue;
+      }
+      throw e;
     }
   }
-  if (buf) push(buf);
-  return out;
+  // last resort
+  return plaidPost('/link/token/create', { ...baseReq, products: ['transactions'] })
+    .then(out => ({ ...out, products_used: ['transactions'] }));
 }
-async function knowledgeInit() {
-  KNOW_INDEX = [];
-  KNOW_STATS = { files: 0, chunks: 0, bytes: 0, indexed: 0 };
+function needToken(res, userId) {
+  const token = tokens.get(userId);
+  if (!token) json(res, 401, { error: 'NO_LINKED_ITEM_FOR_USER' });
+  return token;
+}
+function safePlaid(res, fn) {
+  return fn().catch(err => {
+    console.error('Plaid error:', err);
+    const code = err?.error_code || 'PLAID_ERROR';
+    const status = (err?.http_status >= 400 && err?.http_status <= 599) ? err.http_status : 500;
+    json(res, status, { error: code, details: err });
+  });
+}
 
-  if (!fs.existsSync(BOOKS_DIR)) {
-    console.log('knowledge: no /data/books directory (optional)');
-    return KNOW_STATS;
-  }
-  const files = (await fsp.readdir(BOOKS_DIR, { withFileTypes: true }))
-    .filter(e => e.isFile() && e.name.toLowerCase().endsWith('.txt'))
-    .map(e => path.join(BOOKS_DIR, e.name));
+// ---------- HTTP Server ----------
+const server = http.createServer(async (req, res) => {
+  cors(res);
+  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
 
-  for (const file of files) {
-    const raw = await fsp.readFile(file, 'utf8');
-    KNOW_STATS.files += 1;
-    KNOW_STATS.bytes += Buffer.byteLength(raw, 'utf8');
-    const book = path.basename(file, '.txt').replace(/_/g, ' ');
-    const chunks = chunkText(raw);
-    for (const chunk of chunks) {
-      const tokens = tokenize(chunk);
-      if (!tokens.length) continue;
-      KNOW_INDEX.push({ book, chunk, tokens, tf: tf(tokens) });
-      KNOW_STATS.chunks += 1;
+  const parsed = url.parse(req.url, true);
+  const path = parsed.pathname;
+
+  try {
+    // Health
+    if (req.method === 'GET' && path === '/') {
+      return json(res, 200, { ok: true, env: PLAID_ENV, countries: COUNTRY_CODES });
     }
-  }
-  KNOW_INDEX.sort((a,b)=>a.book.localeCompare(b.book));
-  KNOW_STATS.indexed = KNOW_INDEX.length;
-  console.log('knowledge: loaded', KNOW_STATS);
-  return KNOW_STATS;
-}
-function knowledgeSearch(query, topK = 5) {
-  const qTokens = tokenize(query);
-  if (!qTokens.length || !KNOW_INDEX.length) return [];
-  const qTF = tf(qTokens);
 
-  const hints = {
-    tax: /tax|irs|deduct|credit|refund|w[-\s]?2|1099|schedule|business/i.test(query),
-    invest: /invest|portfolio|etf|stock|bond|allocation|rebalance|index/i.test(query),
-    debt: /debt|loan|snowball|avalanche|interest|apr/i.test(query),
-    budget: /budget|50\/?30\/?20|cash flow|envelope|save/i.test(query),
-  };
-  const boost = (book) => {
-    const b = book.toLowerCase();
-    let x = 1.0;
-    if (hints.tax && (b.includes('tax'))) x += 0.25;
-    if (hints.invest && (b.includes('investor') || b.includes('money'))) x += 0.2;
-    if (hints.debt && (b.includes('total money') || b.includes('rich dad'))) x += 0.15;
-    if (hints.budget && (b.includes('dummies') || b.includes('money'))) x += 0.1;
-    return x;
-  };
+    // Create Link Token (smart retry)
+    if (req.method === 'POST' && path === '/plaid/link_token/create') {
+      const body = await readJSON(req);
+      const userId = body.userId || uid();
 
-  return KNOW_INDEX.map(e => {
-    const sim = cosine(e.tf, qTF);
-    const lenPenalty = Math.min(1, 400 / Math.max(100, e.tokens.length));
-    return { score: sim * lenPenalty * boost(e.book), book: e.book, excerpt: e.chunk.slice(0, 600) };
-  }).filter(s => s.score > 0.01)
-    .sort((a,b)=>b.score - a.score)
-    .slice(0, topK);
-}
+      const baseReq = {
+        user: { client_user_id: userId },
+        client_name: 'ACTIV',
+        language: 'en',
+        country_codes: COUNTRY_CODES,
+      };
+      if (process.env.PLAID_REDIRECT_URI) baseReq.redirect_uri = process.env.PLAID_REDIRECT_URI;
+      if (process.env.WEBHOOK_URL) baseReq.webhook = process.env.WEBHOOK_URL;
 
-// fire up knowledge at boot (non-blocking for Plaid)
-knowledgeInit().catch(err => console.error('knowledge init error', err));
+      return safePlaid(res, async () => {
+        const data = await linkTokenCreateSmart(baseReq, body.products || PREFERRED_PRODUCTS);
+        json(res, 200, {
+          link_token: data.link_token,
+          expiration: data.expiration,
+          userId,
+          products_used: data.products_used
+        });
+      });
+    }
 
-// ------------------------ Express app ------------------------
-const app = express();
-app.use(cors());
-app.use(express.json());
+    // Exchange public_token
+    if (req.method === 'POST' && path === '/plaid/exchange_public_token') {
+      const body = await readJSON(req);
+      if (!body.public_token) return json(res, 400, { error: 'MISSING_PUBLIC_TOKEN' });
+      const userId = body.userId || 'default';
+      return safePlaid(res, async () => {
+        const data = await plaidPost('/item/public_token/exchange', { public_token: body.public_token });
+        tokens.set(userId, data.access_token); // never return it
+        json(res, 200, { item_id: data.item_id, stored_for_user: userId });
+      });
+    }
 
-// health
-app.get('/ping', (req, res) => {
-  res.json({ status: 'ok', plaid_env: PLAID_ENV, knowledge: KNOW_STATS });
-});
+    // Accounts + Balances (primary)
+    if (req.method === 'GET' && path === '/plaid/accounts') {
+      const userId = (parsed.query.userId || 'default').toString();
+      const token = needToken(res, userId); if (!token) return;
+      return safePlaid(res, async () => {
+        const data = await plaidPost('/accounts/balance/get', { access_token: token });
+        json(res, 200, data);
+      });
+    }
+    // Alias for balances
+    if (req.method === 'GET' && path === '/plaid/balances') {
+      const userId = (parsed.query.userId || 'default').toString();
+      const token = needToken(res, userId); if (!token) return;
+      return safePlaid(res, async () => {
+        const data = await plaidPost('/accounts/balance/get', { access_token: token });
+        json(res, 200, data);
+      });
+    }
 
-// ---- Plaid: Link token ----
-app.post('/plaid/link_token/create', async (req, res) => {
-  try {
-    const { user_id } = req.body || {};
-    const response = await plaid.linkTokenCreate({
-      user: { client_user_id: String(user_id || 'demo-user') },
-      client_name: 'ACTIV FINANCE JAMARI',
-      products: ['transactions', 'balances', 'investments'],
-      country_codes: ['US'],
-      language: 'en',
-      // redirect_uri: (optional, if you configured OAuth)
-    });
-    res.json(response.data);
+    // Transactions (date range)
+    if (req.method === 'GET' && path === '/plaid/transactions') {
+      const userId = (parsed.query.userId || 'default').toString();
+      const token = needToken(res, userId); if (!token) return;
+
+      const now = new Date();
+      const end = (parsed.query.end || now.toISOString().slice(0,10));
+      const start = (parsed.query.start || new Date(now.getTime() - 30*24*3600*1000).toISOString().slice(0,10));
+
+      return safePlaid(res, async () => {
+        const data = await plaidPost('/transactions/get', {
+          access_token: token, start_date: start, end_date: end, options: { count: 250, offset: 0 }
+        });
+        json(res, 200, data);
+      });
+    }
+
+    // Transactions Sync (optional incremental)
+    if (req.method === 'POST' && path === '/plaid/transactions/sync') {
+      const body = await readJSON(req);
+      const userId = (body.userId || 'default').toString();
+      const token = needToken(res, userId); if (!token) return;
+      const cursor = body.cursor || null;
+      return safePlaid(res, async () => {
+        const data = await plaidPost('/transactions/sync', { access_token: token, cursor, count: 500 });
+        json(res, 200, data);
+      });
+    }
+
+    // ---- LIABILITIES ----
+    if (req.method === 'GET' && path === '/plaid/liabilities') {
+      const userId = (parsed.query.userId || 'default').toString();
+      const token = needToken(res, userId); if (!token) return;
+      return safePlaid(res, async () => {
+        const data = await plaidPost('/liabilities/get', { access_token: token });
+        json(res, 200, data);
+      });
+    }
+
+    // ---- INVESTMENTS ----
+    if (req.method === 'GET' && path === '/plaid/investments/holdings') {
+      const userId = (parsed.query.userId || 'default').toString();
+      const token = needToken(res, userId); if (!token) return;
+      return safePlaid(res, async () => {
+        const data = await plaidPost('/investments/holdings/get', { access_token: token });
+        json(res, 200, data);
+      });
+    }
+    if (req.method === 'GET' && path === '/plaid/investments/transactions') {
+      const userId = (parsed.query.userId || 'default').toString();
+      const token = needToken(res, userId); if (!token) return;
+
+      const now = new Date();
+      const end = (parsed.query.end || now.toISOString().slice(0,10));
+      const start = (parsed.query.start || new Date(now.getTime() - 90*24*3600*1000).toISOString().slice(0,10));
+
+      return safePlaid(res, async () => {
+        const data = await plaidPost('/investments/transactions/get', {
+          access_token: token, start_date: start, end_date: end
+        });
+        json(res, 200, data);
+      });
+    }
+
+    // ---- AUTH (routing/account numbers for ACH) ----
+    if (req.method === 'GET' && path === '/plaid/auth') {
+      const userId = (parsed.query.userId || 'default').toString();
+      const token = needToken(res, userId); if (!token) return;
+      return safePlaid(res, async () => {
+        const data = await plaidPost('/auth/get', { access_token: token });
+        json(res, 200, data);
+      });
+    }
+
+    // ---- IDENTITY ----
+    if (req.method === 'GET' && path === '/plaid/identity') {
+      const userId = (parsed.query.userId || 'default').toString();
+      const token = needToken(res, userId); if (!token) return;
+      return safePlaid(res, async () => {
+        const data = await plaidPost('/identity/get', { access_token: token });
+        json(res, 200, data);
+      });
+    }
+
+    // Item info / remove
+    if (req.method === 'GET' && path === '/plaid/item') {
+      const userId = (parsed.query.userId || 'default').toString();
+      const token = needToken(res, userId); if (!token) return;
+      return safePlaid(res, async () => {
+        const data = await plaidPost('/item/get', { access_token: token });
+        json(res, 200, data);
+      });
+    }
+    if (req.method === 'POST' && path === '/plaid/item/remove') {
+      const body = await readJSON(req);
+      const userId = (body.userId || 'default').toString();
+      const token = needToken(res, userId); if (!token) return;
+      return safePlaid(res, async () => {
+        const data = await plaidPost('/item/remove', { access_token: token });
+        tokens.delete(userId);
+        json(res, 200, data);
+      });
+    }
+
+    // Webhook (optional)
+    if (req.method === 'POST' && path === '/plaid/webhook') {
+      const body = await readJSON(req);
+      console.log('PLAID WEBHOOK:', JSON.stringify(body));
+      res.writeHead(200);
+      return res.end();
+    }
+
+    // Not found
+    json(res, 404, { error: 'NOT_FOUND' });
   } catch (err) {
-    console.error('link_token error:', err?.response?.data || err.message);
-    res.status(500).json({ error: 'Failed to create link_token' });
+    console.error('Server error:', err);
+    json(res, 500, { error: 'SERVER_ERROR', details: err });
   }
 });
 
-// ---- Plaid: exchange public token ----
-app.post('/plaid/exchange_public_token', async (req, res) => {
-  try {
-    const { public_token } = req.body || {};
-    const resp = await plaid.itemPublicTokenExchange({ public_token });
-    ACCESS_TOKEN = resp.data.access_token;
-    res.json({ ok: true });
-  } catch (err) {
-    console.error('exchange error:', err?.response?.data || err.message);
-    res.status(500).json({ error: 'Failed to exchange public_token' });
-  }
-});
-
-// ---- Balances (real-time) ----
-app.get('/plaid/balances', async (_req, res) => {
-  try {
-    if (!ACCESS_TOKEN) return res.status(400).json({ error: 'not_linked' });
-    const resp = await plaid.accountsBalanceGet({ access_token: ACCESS_TOKEN });
-    res.json(resp.data);
-  } catch (err) {
-    console.error('balances error:', err?.response?.data || err.message);
-    res.status(500).json({ error: 'balances_failed' });
-  }
-});
-
-// ---- Transactions (last 60 days) ----
-app.get('/plaid/transactions', async (req, res) => {
-  try {
-    if (!ACCESS_TOKEN) return res.status(400).json({ error: 'not_linked' });
-    const end = new Date();
-    const start = new Date(); start.setDate(start.getDate() - 60);
-    const fmt = (d)=>d.toISOString().slice(0,10);
-
-    const opts = {
-      access_token: ACCESS_TOKEN,
-      start_date: fmt(start),
-      end_date: fmt(end),
-      options: { count: 250, offset: 0 }
-    };
-    const resp = await plaid.transactionsGet(opts);
-    res.json(resp.data);
-  } catch (err) {
-    console.error('transactions error:', err?.response?.data || err.message);
-    res.status(500).json({ error: 'transactions_failed' });
-  }
-});
-
-// ---- Investments (holdings) ----
-app.get('/plaid/investments/holdings', async (_req, res) => {
-  try {
-    if (!ACCESS_TOKEN) return res.status(400).json({ error: 'not_linked' });
-    const resp = await plaid.investmentsHoldingsGet({ access_token: ACCESS_TOKEN });
-    res.json(resp.data);
-  } catch (err) {
-    console.error('investments error:', err?.response?.data || err.message);
-    res.status(500).json({ error: 'investments_failed' });
-  }
-});
-
-// ---- Knowledge search endpoint ----
-app.get('/knowledge/search', (req, res) => {
-  const q = (req.query.q || '').toString();
-  const k = Math.min(10, Math.max(1, parseInt(req.query.k || '5', 10)));
-  const hits = q ? knowledgeSearch(q, k) : [];
-  res.json({ query: q, hits, stats: KNOW_STATS });
-});
-
-// root
-app.get('/', (_req, res) => res.json({ ok: true, service: 'ACTIV backend' }));
-
-// start server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`ACTIV backend listening on :${PORT} (env=${PLAID_ENV})`);
+server.listen(PORT, () => {
+  console.log(`ACTIV backend running on :${PORT} (PLAID: ${PLAID_ENV})`);
 });
