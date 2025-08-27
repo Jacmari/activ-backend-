@@ -36,7 +36,7 @@ const tokens = new Map(); // userId -> access_token
 function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept');
 }
 function json(res, code, obj) {
   cors(res);
@@ -104,7 +104,6 @@ async function linkTokenCreateSmart(baseReq, prods) {
         if (!products.length) break;
         continue;
       }
-      // If product not enabled for your account
       if (code === 'PRODUCTS_NOT_SUPPORTED' || code === 'PRODUCTS_NOT_ENABLED') {
         // Try again with a minimal viable set
         products = ['transactions','auth'].filter(p => products.includes(p));
@@ -145,11 +144,15 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && path === '/') {
       return json(res, 200, { ok: true, env: PLAID_ENV, countries: COUNTRY_CODES });
     }
+    // Health alias to match frontend test
+    if (req.method === 'GET' && path === '/ping') {
+      return json(res, 200, { ok: true, env: PLAID_ENV });
+    }
 
     // Create Link Token (smart retry)
     if (req.method === 'POST' && path === '/plaid/link_token/create') {
       const body = await readJSON(req);
-      const userId = body.userId || uid();
+      const userId = body.userId || body.user_id || uid(); // support both keys
 
       const baseReq = {
         user: { client_user_id: userId },
@@ -175,7 +178,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && path === '/plaid/exchange_public_token') {
       const body = await readJSON(req);
       if (!body.public_token) return json(res, 400, { error: 'MISSING_PUBLIC_TOKEN' });
-      const userId = body.userId || 'default';
+      const userId = body.userId || body.user_id || 'default';
       return safePlaid(res, async () => {
         const data = await plaidPost('/item/public_token/exchange', { public_token: body.public_token });
         tokens.set(userId, data.access_token); // never return it
@@ -222,7 +225,7 @@ const server = http.createServer(async (req, res) => {
     // Transactions Sync (optional incremental)
     if (req.method === 'POST' && path === '/plaid/transactions/sync') {
       const body = await readJSON(req);
-      const userId = (body.userId || 'default').toString();
+      const userId = (body.userId || body.user_id || 'default').toString();
       const token = needToken(res, userId); if (!token) return;
       const cursor = body.cursor || null;
       return safePlaid(res, async () => {
@@ -297,13 +300,45 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && path === '/plaid/item/remove') {
       const body = await readJSON(req);
-      const userId = (body.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
+      const userId = (body.userId || body.user_id || 'default').toString();
+      const token = tokens.get(userId);
+      if (!token) {
+        return json(res, 200, { ok: true, status: 'NO_LINKED_ITEM' });
+      }
       return safePlaid(res, async () => {
         const data = await plaidPost('/item/remove', { access_token: token });
         tokens.delete(userId);
-        json(res, 200, data);
+        json(res, 200, { ok: true, ...data, unlinked: true, userId });
       });
+    }
+
+    // Aliases to match your frontend exactly:
+    // POST /plaid/unlink -> same as /plaid/item/remove
+    if (req.method === 'POST' && path === '/plaid/unlink') {
+      const body = await readJSON(req);
+      const userId = (body.userId || body.user_id || 'default').toString();
+      const token = tokens.get(userId);
+      if (!token) {
+        return json(res, 200, { ok: true, status: 'NO_LINKED_ITEM' });
+      }
+      return safePlaid(res, async () => {
+        const data = await plaidPost('/item/remove', { access_token: token });
+        tokens.delete(userId);
+        json(res, 200, { ok: true, ...data, unlinked: true, userId });
+      });
+    }
+
+    // Delete user/account (app-level) — matches frontend /user/delete
+    if (req.method === 'POST' && path === '/user/delete') {
+      const body = await readJSON(req);
+      const userId = (body.userId || body.user_id || 'default').toString();
+      const token = tokens.get(userId);
+      // Try to remove Plaid item if present
+      if (token) {
+        try { await plaidPost('/item/remove', { access_token: token }); } catch(_) {}
+        tokens.delete(userId);
+      }
+      return json(res, 200, { ok: true, deleted: true, userId });
     }
 
     // Webhook (optional)
