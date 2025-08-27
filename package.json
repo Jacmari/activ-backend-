@@ -1,17 +1,19 @@
 {
-  "name": "activ-finance-jamari-backend",
+  "name": "activ-banking-backend",
   "version": "1.0.0",
+  "description": "Backend for Activ Finance with Plaid + JAMARI Knowledge Stack",
   "main": "server.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
+    "express": "^4.18.2",
     "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "plaid": "^23.0.0"
+    "body-parser": "^1.20.2",
+    "plaid": "^27.0.0",
+    "dotenv": "^16.3.1"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=16.x"
   }
 }
