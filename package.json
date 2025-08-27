@@ -1,27 +1,49 @@
 {
   "info": {
     "_postman_id": "7d5f2d5a-7a2e-4e1e-9f10-a41d5f7d9e11",
-    "name": "ACTIV Backend (Plaid) — Postman Collection",
+    "name": "ACTIV Backend (Plaid) — Postman",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
-    "description": "One-file backend endpoints for ACTIV. Set the `baseUrl` variable to your Heroku URL."
+    "description": "Drop-in backend for ACTIV. Set {{baseUrl}} to your Heroku app."
   },
   "item": [
-    { "name": "Ping", "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/ping", "host": ["{{baseUrl}}"], "path": ["ping"] } } },
-    { "name": "Create Link Token", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"userId\": \"default\",\n  \"products\": [\"transactions\",\"auth\",\"identity\",\"liabilities\",\"investments\"]\n}" }, "url": { "raw": "{{baseUrl}}/plaid/link_token/create", "host": ["{{baseUrl}}"], "path": ["plaid","link_token","create"] } } },
-    { "name": "Exchange Public Token", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"public_token\": \"REPLACE_WITH_PUBLIC_TOKEN\",\n  \"userId\": \"default\"\n}" }, "url": { "raw": "{{baseUrl}}/plaid/exchange_public_token", "host": ["{{baseUrl}}"], "path": ["plaid","exchange_public_token"] } } },
-    { "name": "Accounts + Balances", "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/plaid/accounts?userId=default", "host": ["{{baseUrl}}"], "path": ["plaid","accounts"], "query": [{ "key": "userId", "value": "default" }] } } },
-    { "name": "Balances (alias)", "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/plaid/balances?userId=default", "host": ["{{baseUrl}}"], "path": ["plaid","balances"], "query": [{ "key": "userId", "value": "default" }] } } },
-    { "name": "Transactions (range)", "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/plaid/transactions?userId=default&start=2025-06-01&end=2025-08-27", "host": ["{{baseUrl}}"], "path": ["plaid","transactions"], "query": [{ "key": "userId", "value": "default" }, { "key": "start", "value": "2025-06-01" }, { "key": "end", "value": "2025-08-27" }] } } },
-    { "name": "Transactions Sync", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"userId\": \"default\",\n  \"cursor\": null\n}" }, "url": { "raw": "{{baseUrl}}/plaid/transactions/sync", "host": ["{{baseUrl}}"], "path": ["plaid","transactions","sync"] } } },
-    { "name": "Liabilities", "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/plaid/liabilities?userId=default", "host": ["{{baseUrl}}"], "path": ["plaid","liabilities"], "query": [{ "key": "userId", "value": "default" }] } } },
-    { "name": "Investments — Holdings", "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/plaid/investments/holdings?userId=default", "host": ["{{baseUrl}}"], "path": ["plaid","investments","holdings"], "query": [{ "key": "userId", "value": "default" }] } } },
-    { "name": "Investments — Transactions", "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/plaid/investments/transactions?userId=default&start=2025-05-29&end=2025-08-27", "host": ["{{baseUrl}}"], "path": ["plaid","investments","transactions"], "query": [{ "key": "userId", "value": "default" }, { "key": "start", "value": "2025-05-29" }, { "key": "end", "value": "2025-08-27" }] } } },
-    { "name": "Auth", "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/plaid/auth?userId=default", "host": ["{{baseUrl}}"], "path": ["plaid","auth"], "query": [{ "key": "userId", "value": "default" }] } } },
-    { "name": "Identity", "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/plaid/identity?userId=default", "host": ["{{baseUrl}}"], "path": ["plaid","identity"], "query": [{ "key": "userId", "value": "default" }] } } },
-    { "name": "Item Info", "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/plaid/item?userId=default", "host": ["{{baseUrl}}"], "path": ["plaid","item"], "query": [{ "key": "userId", "value": "default" }] } } },
-    { "name": "Item Remove", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"userId\": \"default\"\n}" }, "url": { "raw": "{{baseUrl}}/plaid/item/remove", "host": ["{{baseUrl}}"], "path": ["plaid","item","remove"] } } },
-    { "name": "Unlink (alias)", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"userId\": \"default\"\n}" }, "url": { "raw": "{{baseUrl}}/plaid/unlink", "host": ["{{baseUrl}}"], "path": ["plaid","unlink"] } } },
-    { "name": "Delete User", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"userId\": \"default\"\n}" }, "url": { "raw": "{{baseUrl}}/user/delete", "host": ["{{baseUrl}}"], "path": ["user","delete"] } } }
+    { "name": "Health",
+      "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/ping", "host": ["{{baseUrl}}"], "path": ["ping"] } }
+    },
+    { "name": "Create Link Token",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\n  \"user_id\": \"default\",\n  \"products\": [\"transactions\",\"auth\",\"identity\",\"liabilities\",\"investments\"]\n}" },
+        "url": { "raw": "{{baseUrl}}/plaid/link_token/create", "host": ["{{baseUrl}}"], "path": ["plaid","link_token","create"] }
+      }
+    },
+    { "name": "Exchange Public Token",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\n  \"public_token\": \"REPLACE_WITH_PUBLIC_TOKEN\",\n  \"user_id\": \"default\"\n}" },
+        "url": { "raw": "{{baseUrl}}/plaid/exchange_public_token", "host": ["{{baseUrl}}"], "path": ["plaid","exchange_public_token"] }
+      }
+    },
+    { "name": "Balances",
+      "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/plaid/balances?userId=default", "host": ["{{baseUrl}}"], "path": ["plaid","balances"], "query": [{ "key": "userId", "value": "default" }] } }
+    },
+    { "name": "Unlink",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{ \"user_id\": \"default\" }" },
+        "url": { "raw": "{{baseUrl}}/plaid/unlink", "host": ["{{baseUrl}}"], "path": ["plaid","unlink"] }
+      }
+    },
+    { "name": "Delete Account",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{ \"user_id\": \"default\" }" },
+        "url": { "raw": "{{baseUrl}}/user/delete", "host": ["{{baseUrl}}"], "path": ["user","delete"] }
+      }
+    }
   ],
-  "variable": [{ "key": "baseUrl", "value": "https://YOUR-HEROKU-APP.herokuapp.com", "type": "string" }]
+  "variable": [{ "key": "baseUrl", "value": "https://YOUR-HEROKU-APP.herokuapp.com" }]
 }
