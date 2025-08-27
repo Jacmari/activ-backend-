@@ -1,15 +1,20 @@
 {
   "info": {
-    "_postman_id": "7d5f2d5a-7a2e-4e1e-9f10-a41d5f7d9e11",
-    "name": "ACTIV Backend (Plaid) — Postman",
+    "_postman_id": "b7a6d0ea-4b3e-4a3f-8d2e-activ-postman",
+    "name": "ACTIV Backend (Plaid) — Collection",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
-    "description": "Drop-in backend for ACTIV. Set {{baseUrl}} to your Heroku app."
+    "description": "Endpoints matched to the front-end. Set {{baseUrl}} to your Heroku URL."
   },
   "item": [
-    { "name": "Health",
-      "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/ping", "host": ["{{baseUrl}}"], "path": ["ping"] } }
+    {
+      "name": "Ping",
+      "request": {
+        "method": "GET",
+        "url": { "raw": "{{baseUrl}}/ping", "host": ["{{baseUrl}}"], "path": ["ping"] }
+      }
     },
-    { "name": "Create Link Token",
+    {
+      "name": "Create Link Token",
       "request": {
         "method": "POST",
         "header": [{ "key": "Content-Type", "value": "application/json" }],
@@ -17,33 +22,42 @@
         "url": { "raw": "{{baseUrl}}/plaid/link_token/create", "host": ["{{baseUrl}}"], "path": ["plaid","link_token","create"] }
       }
     },
-    { "name": "Exchange Public Token",
+    {
+      "name": "Exchange Public Token",
       "request": {
         "method": "POST",
         "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": { "mode": "raw", "raw": "{\n  \"public_token\": \"REPLACE_WITH_PUBLIC_TOKEN\",\n  \"user_id\": \"default\"\n}" },
+        "body": { "mode": "raw", "raw": "{\n  \"public_token\": \"REPLACE_FROM_LINK\",\n  \"user_id\": \"default\"\n}" },
         "url": { "raw": "{{baseUrl}}/plaid/exchange_public_token", "host": ["{{baseUrl}}"], "path": ["plaid","exchange_public_token"] }
       }
     },
-    { "name": "Balances",
-      "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/plaid/balances?userId=default", "host": ["{{baseUrl}}"], "path": ["plaid","balances"], "query": [{ "key": "userId", "value": "default" }] } }
+    {
+      "name": "Balances",
+      "request": {
+        "method": "GET",
+        "url": { "raw": "{{baseUrl}}/plaid/balances?userId=default", "host": ["{{baseUrl}}"], "path": ["plaid","balances"], "query": [{ "key": "userId", "value": "default" }] }
+      }
     },
-    { "name": "Unlink",
+    {
+      "name": "Unlink (remove item)",
       "request": {
         "method": "POST",
         "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": { "mode": "raw", "raw": "{ \"user_id\": \"default\" }" },
+        "body": { "mode": "raw", "raw": "{\n  \"user_id\": \"default\"\n}" },
         "url": { "raw": "{{baseUrl}}/plaid/unlink", "host": ["{{baseUrl}}"], "path": ["plaid","unlink"] }
       }
     },
-    { "name": "Delete Account",
+    {
+      "name": "Delete User",
       "request": {
         "method": "POST",
         "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": { "mode": "raw", "raw": "{ \"user_id\": \"default\" }" },
+        "body": { "mode": "raw", "raw": "{\n  \"user_id\": \"default\"\n}" },
         "url": { "raw": "{{baseUrl}}/user/delete", "host": ["{{baseUrl}}"], "path": ["user","delete"] }
       }
     }
   ],
-  "variable": [{ "key": "baseUrl", "value": "https://YOUR-HEROKU-APP.herokuapp.com" }]
+  "variable": [
+    { "key": "baseUrl", "value": "https://activ-banking-backend-8cd8b5a1f5c9.herokuapp.com" }
+  ]
 }
