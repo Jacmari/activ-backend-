@@ -3,6 +3,7 @@
 
 const http = require('http');
 const url = require('url');
+const net = require('net'); // <— for Redis, no npm deps
 
 // ---------- ENV ----------
 const PORT = process.env.PORT || 3000;
@@ -39,8 +40,84 @@ const GEMINI_MODEL   = process.env.GEMINI_MODEL   || 'gemini-1.5-flash';
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 const PLAID_REDIRECT_URI = process.env.PLAID_REDIRECT_URI || '';
 
-// ---------- Simple in-memory token store (userId -> access_token) ----------
+// ---------- Token store (Map + optional Redis) ----------
 const tokens = new Map();
+
+const REDIS_URL = process.env.REDIS_URL || '';
+let REDIS_CFG = null;
+if (REDIS_URL) {
+  try {
+    // formats: redis://:pass@host:port or rediss://...
+    const u = new URL(REDIS_URL.replace(/^rediss?:\/\//, 'redis://'));
+    REDIS_CFG = {
+      host: u.hostname,
+      port: Number(u.port || 6379),
+      pass: (u.password || '').length ? u.password : null,
+      tls: /^rediss:\/\//i.test(process.env.REDIS_URL || '')
+    };
+  } catch (_e) {
+    // If malformed, ignore and continue in-memory
+    REDIS_CFG = null;
+  }
+}
+
+// Minimal RESP encode
+function redisEncode(cmd, args) {
+  const arr = [cmd, ...args].map(x => String(x));
+  let out = `*${arr.length}\r\n`;
+  for (const a of arr) out += `$${Buffer.byteLength(a)}\r\n${a}\r\n`;
+  return out;
+}
+// Minimal Redis single-command client (GET/SET/DEL)
+function redisCommand(cmd, ...args) {
+  return new Promise((resolve, reject) => {
+    if (!REDIS_CFG) return reject(new Error('REDIS_DISABLED'));
+    const socket = net.createConnection({ host: REDIS_CFG.host, port: REDIS_CFG.port }, () => {
+      const send = (c, ...a) => socket.write(redisEncode(c, a));
+      if (REDIS_CFG.pass) send('AUTH', REDIS_CFG.pass);
+      send(cmd, ...args);
+    });
+    socket.setTimeout(4000);
+    let data = '';
+    socket.on('data', chunk => data += chunk.toString('utf8'));
+    socket.on('timeout', () => { socket.destroy(); reject(new Error('REDIS_TIMEOUT')); });
+    socket.on('error', err => reject(err));
+    socket.on('close', () => {
+      // Parse very small RESP replies
+      if (data.startsWith('+')) return resolve(data.slice(1).trim());             // +OK
+      if (data.startsWith(':')) return resolve(Number(data.slice(1).trim()));     // :1
+      if (data.startsWith('-')) return reject(new Error(data.slice(1).trim()));   // -ERR ...
+      if (data.startsWith('$')) {                                                 // $len\r\nvalue\r\n
+        const len = parseInt(data.slice(1, data.indexOf('\r\n')), 10);
+        if (len === -1) return resolve(null);
+        const start = data.indexOf('\r\n') + 2;
+        return resolve(data.substr(start, len));
+      }
+      resolve(null);
+    });
+  });
+}
+
+async function tokenGet(userId) {
+  // Map cache first
+  if (tokens.has(userId)) return tokens.get(userId);
+  if (!REDIS_CFG) return null;
+  try {
+    const v = await redisCommand('GET', `plaid:token:${userId}`);
+    if (v) tokens.set(userId, v);
+    return v || null;
+  } catch (_e) { return null; }
+}
+async function tokenSet(userId, token) {
+  tokens.set(userId, token);
+  if (!REDIS_CFG) return;
+  try { await redisCommand('SET', `plaid:token:${userId}`, token); } catch (_e) {}
+}
+async function tokenDel(userId) {
+  tokens.delete(userId);
+  if (!REDIS_CFG) return;
+  try { await redisCommand('DEL', `plaid:token:${userId}`); } catch (_e) {}
+}
 
 // ---------- Helpers ----------
 function cors(res) {
@@ -60,51 +137,26 @@ function readJSON(req) {
     req.on('end', () => { try { resolve(JSON.parse(data || '{}')); } catch { resolve({}); } });
   });
 }
-
-// --------- ONLY CHANGE: add timeout + one quick retry around Plaid fetch ----------
 async function plaidPost(path, body) {
-  const tryOnce = async () => {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 25000); // 25s < Heroku 30s
-    try {
-      const r = await fetch(`${BASE}${path}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'PLAID-CLIENT-ID': PLAID_CLIENT_ID,
-          'PLAID-SECRET': PLAID_SECRET,
-        },
-        body: JSON.stringify(body),
-        signal: ctrl.signal,
-      });
-      const text = await r.text();
-      let data;
-      try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
-      if (!r.ok) {
-        const err = data || {};
-        err.http_status = r.status;
-        throw err;
-      }
-      return data;
-    } finally {
-      clearTimeout(t);
-    }
-  };
-
-  try {
-    return await tryOnce();
-  } catch (e) {
-    // If it was a timeout or a transient fetch error, do one quick retry
-    const transient = (e && (e.name === 'AbortError' || e.code === 'ECONNRESET' || e.code === 'ETIMEDOUT'));
-    if (transient) {
-      await new Promise(r => setTimeout(r, 600));
-      return await tryOnce();
-    }
-    throw e;
+  const r = await fetch(`${BASE}${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'PLAID-CLIENT-ID': PLAID_CLIENT_ID,
+      'PLAID-SECRET': PLAID_SECRET,
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await r.text();
+  let data;
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+  if (!r.ok) {
+    const err = data || {};
+    err.http_status = r.status;
+    throw err;
   }
+  return data;
 }
-// --------- END OF CHANGE ----------
-
 function uid() { return (Date.now().toString(36) + Math.random().toString(36).slice(2)); }
 function cleanProducts(list) {
   return (list || PREFERRED_PRODUCTS)
@@ -143,8 +195,8 @@ async function linkTokenCreateSmart(baseReq, prods) {
   const out = await plaidPost('/link/token/create', { ...baseReq, products: ['transactions'] });
   return { ...out, products_used: ['transactions'] };
 }
-function needToken(res, userId) {
-  const token = tokens.get(userId);
+async function needToken(res, userId) {
+  const token = await tokenGet(userId);
   if (!token) json(res, 401, { error: 'NO_LINKED_ITEM_FOR_USER' });
   return token;
 }
@@ -186,7 +238,7 @@ function money(n) { return Math.round((+n||0)*100)/100; }
 
 // Build KPI summary from Plaid data (best-effort)
 async function buildSummary(userId='default') {
-  const access = tokens.get(userId);
+  const access = await tokenGet(userId);
   if (!access) return { linked:false };
 
   const [acc, liab, inv, tx] = await Promise.all([
@@ -196,7 +248,6 @@ async function buildSummary(userId='default') {
     getTransactions(access, daysAgo(30), daysAgo(0)),
   ]);
 
-  // Accounts / Cash
   let accounts = (acc && acc.accounts) || [];
   const cashAccts = accounts.filter(a => a.type === 'depository');
   const checkingBal = cashAccts.filter(a => a.subtype === 'checking')
@@ -211,7 +262,6 @@ async function buildSummary(userId='default') {
   const cashOther= money(sum(otherCash));
   const totalCash= money(checking + savings + cashOther);
 
-  // Liabilities total due (balances outstanding)
   let totalLiabilities = 0;
   if (liab && liab.liabilities) {
     const L = liab.liabilities;
@@ -222,7 +272,6 @@ async function buildSummary(userId='default') {
     totalLiabilities = money(sum(cc) + sum(stu) + sum(mort) + sum(auto));
   }
 
-  // Investments total (institution_value if available)
   let totalInvestments = 0;
   if (inv && inv.holdings && inv.securities) {
     const holdings = inv.holdings;
@@ -236,7 +285,6 @@ async function buildSummary(userId='default') {
     })));
   }
 
-  // Transactions KPIs
   let income30 = 0, spend30 = 0, netCashFlow = 0, monthlySpend = 0, savingsRate = 0;
   if (tx && tx.transactions) {
     const t = tx.transactions;
@@ -247,7 +295,7 @@ async function buildSummary(userId='default') {
       spend30  = money(sum(t.filter(x => x.amount < 0).map(x => -x.amount)));
     }
     netCashFlow = money(income30 - spend30);
-    monthlySpend = spend30 || 2000; // fallback
+    monthlySpend = spend30 || 2000;
     savingsRate = income30 ? Math.max(0, Math.min(1, netCashFlow / income30)) : 0;
   } else {
     monthlySpend = 2000;
@@ -417,7 +465,7 @@ const server = http.createServer(async (req, res) => {
       const userId = body.userId || 'default';
       return safePlaid(res, async () => {
         const data = await plaidPost('/item/public_token/exchange', { public_token: body.public_token });
-        tokens.set(userId, data.access_token);
+        await tokenSet(userId, data.access_token);
         json(res, 200, { item_id: data.item_id, stored_for_user: userId });
       });
     }
@@ -425,7 +473,7 @@ const server = http.createServer(async (req, res) => {
     // Accounts + Balances
     if (req.method === 'GET' && path === '/plaid/accounts') {
       const userId = (parsed.query.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
+      const token = await needToken(res, userId); if (!token) return;
       return safePlaid(res, async () => {
         const data = await plaidPost('/accounts/balance/get', { access_token: token });
         json(res, 200, data);
@@ -434,7 +482,7 @@ const server = http.createServer(async (req, res) => {
     // Alias
     if (req.method === 'GET' && path === '/plaid/balances') {
       const userId = (parsed.query.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
+      const token = await needToken(res, userId); if (!token) return;
       return safePlaid(res, async () => {
         const data = await plaidPost('/accounts/balance/get', { access_token: token });
         json(res, 200, data);
@@ -444,7 +492,7 @@ const server = http.createServer(async (req, res) => {
     // Transactions (range)
     if (req.method === 'GET' && path === '/plaid/transactions') {
       const userId = (parsed.query.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
+      const token = await needToken(res, userId); if (!token) return;
       const end = (parsed.query.end || daysAgo(0));
       const start = (parsed.query.start || daysAgo(30));
       return safePlaid(res, async () => {
@@ -458,7 +506,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && path === '/plaid/transactions/sync') {
       const body = await readJSON(req);
       const userId = (body.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
+      const token = await needToken(res, userId); if (!token) return;
       const cursor = body.cursor || null;
       return safePlaid(res, async () => {
         const data = await plaidPost('/transactions/sync', { access_token: token, cursor, count: 500 });
@@ -469,7 +517,7 @@ const server = http.createServer(async (req, res) => {
     // Liabilities
     if (req.method === 'GET' && path === '/plaid/liabilities') {
       const userId = (parsed.query.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
+      const token = await needToken(res, userId); if (!token) return;
       return safePlaid(res, async () => {
         const data = await plaidPost('/liabilities/get', { access_token: token });
         json(res, 200, data);
@@ -479,7 +527,7 @@ const server = http.createServer(async (req, res) => {
     // Investments
     if (req.method === 'GET' && path === '/plaid/investments/holdings') {
       const userId = (parsed.query.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
+      const token = await needToken(res, userId); if (!token) return;
       return safePlaid(res, async () => {
         const data = await plaidPost('/investments/holdings/get', { access_token: token });
         json(res, 200, data);
@@ -487,7 +535,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && path === '/plaid/investments/transactions') {
       const userId = (parsed.query.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
+      const token = await needToken(res, userId); if (!token) return;
       const end = (parsed.query.end || daysAgo(0));
       const start = (parsed.query.start || daysAgo(90));
       return safePlaid(res, async () => {
@@ -501,7 +549,7 @@ const server = http.createServer(async (req, res) => {
     // Auth
     if (req.method === 'GET' && path === '/plaid/auth') {
       const userId = (parsed.query.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
+      const token = await needToken(res, userId); if (!token) return;
       return safePlaid(res, async () => {
         const data = await plaidPost('/auth/get', { access_token: token });
         json(res, 200, data);
@@ -511,7 +559,7 @@ const server = http.createServer(async (req, res) => {
     // Identity
     if (req.method === 'GET' && path === '/plaid/identity') {
       const userId = (parsed.query.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
+      const token = await needToken(res, userId); if (!token) return;
       return safePlaid(res, async () => {
         const data = await plaidPost('/identity/get', { access_token: token });
         json(res, 200, data);
@@ -521,22 +569,22 @@ const server = http.createServer(async (req, res) => {
     // Item
     if (req.method === 'GET' && path === '/plaid/item') {
       const userId = (parsed.query.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
+      const token = await needToken(res, userId); if (!token) return;
       return safePlaid(res, async () => {
         const data = await plaidPost('/item/get', { access_token: token });
         json(res, 200, data);
       });
     }
 
-    // Unlink (called by your frontend "Unlink Bank")
+    // Unlink
     if (req.method === 'POST' && path === '/plaid/unlink') {
       const body = await readJSON(req);
       const userId = (body.userId || 'default').toString();
-      const token = tokens.get(userId);
+      const token = await tokenGet(userId);
       if (!token) return json(res, 200, { ok:true, message:'Nothing to unlink' });
       return safePlaid(res, async () => {
         await plaidPost('/item/remove', { access_token: token });
-        tokens.delete(userId);
+        await tokenDel(userId);
         json(res, 200, { ok:true });
       });
     }
@@ -545,7 +593,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && path === '/user/delete') {
       const body = await readJSON(req);
       const userId = (body.userId || 'default').toString();
-      tokens.delete(userId);
+      await tokenDel(userId);
       return json(res, 200, { ok:true });
     }
 
@@ -618,5 +666,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`ACTIV backend running on :${PORT} | PLAID_ENV=${PLAID_ENV}`);
+  console.log(`ACTIV backend running on :${PORT} | PLAID_ENV=${PLAID_ENV} | Redis=${REDIS_CFG?'on':'off'}`);
 });
