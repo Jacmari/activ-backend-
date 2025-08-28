@@ -60,26 +60,51 @@ function readJSON(req) {
     req.on('end', () => { try { resolve(JSON.parse(data || '{}')); } catch { resolve({}); } });
   });
 }
+
+// --------- ONLY CHANGE: add timeout + one quick retry around Plaid fetch ----------
 async function plaidPost(path, body) {
-  const r = await fetch(`${BASE}${path}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'PLAID-CLIENT-ID': PLAID_CLIENT_ID,
-      'PLAID-SECRET': PLAID_SECRET,
-    },
-    body: JSON.stringify(body),
-  });
-  const text = await r.text();
-  let data;
-  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
-  if (!r.ok) {
-    const err = data || {};
-    err.http_status = r.status;
-    throw err;
+  const tryOnce = async () => {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 25000); // 25s < Heroku 30s
+    try {
+      const r = await fetch(`${BASE}${path}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'PLAID-CLIENT-ID': PLAID_CLIENT_ID,
+          'PLAID-SECRET': PLAID_SECRET,
+        },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+      const text = await r.text();
+      let data;
+      try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+      if (!r.ok) {
+        const err = data || {};
+        err.http_status = r.status;
+        throw err;
+      }
+      return data;
+    } finally {
+      clearTimeout(t);
+    }
+  };
+
+  try {
+    return await tryOnce();
+  } catch (e) {
+    // If it was a timeout or a transient fetch error, do one quick retry
+    const transient = (e && (e.name === 'AbortError' || e.code === 'ECONNRESET' || e.code === 'ETIMEDOUT'));
+    if (transient) {
+      await new Promise(r => setTimeout(r, 600));
+      return await tryOnce();
+    }
+    throw e;
   }
-  return data;
 }
+// --------- END OF CHANGE ----------
+
 function uid() { return (Date.now().toString(36) + Math.random().toString(36).slice(2)); }
 function cleanProducts(list) {
   return (list || PREFERRED_PRODUCTS)
@@ -215,12 +240,9 @@ async function buildSummary(userId='default') {
   let income30 = 0, spend30 = 0, netCashFlow = 0, monthlySpend = 0, savingsRate = 0;
   if (tx && tx.transactions) {
     const t = tx.transactions;
-    // Simple heuristic: positives = income, negatives = spend (ignore zeros)
-    income30 = money(sum(t.filter(x => x.amount < 0).map(x => -x.amount))); // many banks invert sign; normalize
+    income30 = money(sum(t.filter(x => x.amount < 0).map(x => -x.amount)));
     spend30  = money(sum(t.filter(x => x.amount > 0).map(x => x.amount)));
-    // Some institutions already give positives=debits, negatives=credits; normalize if flipped:
     if (income30 < spend30 && sum(t.map(x=>x.amount)) < 0) {
-      // alternate interpretation: positives are income
       income30 = money(sum(t.filter(x => x.amount > 0).map(x => x.amount)));
       spend30  = money(sum(t.filter(x => x.amount < 0).map(x => -x.amount)));
     }
@@ -233,10 +255,7 @@ async function buildSummary(userId='default') {
     netCashFlow = 0;
   }
 
-  // Runway = cash / monthlySpend
   const runwayMonths = monthlySpend ? money(totalCash / monthlySpend) : 0;
-
-  // Net worth (approx) = cash + investments - liabilities
   const netWorth = money(totalCash + totalInvestments - totalLiabilities);
 
   return {
@@ -335,7 +354,6 @@ async function askGemini(prompt, system) {
 function fuseReplies(replies) {
   const texts = replies.filter(Boolean).map(s => String(s).trim()).filter(Boolean);
   if (!texts.length) return "I'm ready, but no AI providers responded. Check your AI keys.";
-  // Simple fusion: keep first, append non-duplicate sentences from others
   const first = texts[0];
   const seen = new Set(first.split(/(?<=\.)\s+/).map(s=>s.trim().toLowerCase()));
   let extra = [];
