@@ -1,9 +1,8 @@
-// server.js — ACTIV backend (Plaid + JAMARI AI Fusion) — Node 18+, no npm deps.
+// server.js — ACTIV backend (Plaid + JAMARI AI Fusion) — Node 18+, minimal deps.
 // Works on Heroku. Uses built-in fetch. Production-safe CORS + error handling.
 
 const http = require('http');
 const url = require('url');
-const net = require('net'); // <— for Redis, no npm deps
 
 // ---------- ENV ----------
 const PORT = process.env.PORT || 3000;
@@ -40,83 +39,50 @@ const GEMINI_MODEL   = process.env.GEMINI_MODEL   || 'gemini-1.5-flash';
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 const PLAID_REDIRECT_URI = process.env.PLAID_REDIRECT_URI || '';
 
-// ---------- Token store (Map + optional Redis) ----------
-const tokens = new Map();
+// ---------- Token storage (Postgres with in-memory fallback) ----------
+const { Pool } = require('pg');
 
-const REDIS_URL = process.env.REDIS_URL || '';
-let REDIS_CFG = null;
-if (REDIS_URL) {
-  try {
-    // formats: redis://:pass@host:port or rediss://...
-    const u = new URL(REDIS_URL.replace(/^rediss?:\/\//, 'redis://'));
-    REDIS_CFG = {
-      host: u.hostname,
-      port: Number(u.port || 6379),
-      pass: (u.password || '').length ? u.password : null,
-      tls: /^rediss:\/\//i.test(process.env.REDIS_URL || '')
-    };
-  } catch (_e) {
-    // If malformed, ignore and continue in-memory
-    REDIS_CFG = null;
-  }
-}
-
-// Minimal RESP encode
-function redisEncode(cmd, args) {
-  const arr = [cmd, ...args].map(x => String(x));
-  let out = `*${arr.length}\r\n`;
-  for (const a of arr) out += `$${Buffer.byteLength(a)}\r\n${a}\r\n`;
-  return out;
-}
-// Minimal Redis single-command client (GET/SET/DEL)
-function redisCommand(cmd, ...args) {
-  return new Promise((resolve, reject) => {
-    if (!REDIS_CFG) return reject(new Error('REDIS_DISABLED'));
-    const socket = net.createConnection({ host: REDIS_CFG.host, port: REDIS_CFG.port }, () => {
-      const send = (c, ...a) => socket.write(redisEncode(c, a));
-      if (REDIS_CFG.pass) send('AUTH', REDIS_CFG.pass);
-      send(cmd, ...args);
-    });
-    socket.setTimeout(4000);
-    let data = '';
-    socket.on('data', chunk => data += chunk.toString('utf8'));
-    socket.on('timeout', () => { socket.destroy(); reject(new Error('REDIS_TIMEOUT')); });
-    socket.on('error', err => reject(err));
-    socket.on('close', () => {
-      // Parse very small RESP replies
-      if (data.startsWith('+')) return resolve(data.slice(1).trim());             // +OK
-      if (data.startsWith(':')) return resolve(Number(data.slice(1).trim()));     // :1
-      if (data.startsWith('-')) return reject(new Error(data.slice(1).trim()));   // -ERR ...
-      if (data.startsWith('$')) {                                                 // $len\r\nvalue\r\n
-        const len = parseInt(data.slice(1, data.indexOf('\r\n')), 10);
-        if (len === -1) return resolve(null);
-        const start = data.indexOf('\r\n') + 2;
-        return resolve(data.substr(start, len));
-      }
-      resolve(null);
-    });
+const useDb = !!process.env.DATABASE_URL;
+let pool = null;
+if (useDb) {
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
   });
 }
 
-async function tokenGet(userId) {
-  // Map cache first
-  if (tokens.has(userId)) return tokens.get(userId);
-  if (!REDIS_CFG) return null;
-  try {
-    const v = await redisCommand('GET', `plaid:token:${userId}`);
-    if (v) tokens.set(userId, v);
-    return v || null;
-  } catch (_e) { return null; }
+// In-memory fallback (used only if DB not available)
+const memTokens = new Map();
+
+async function initTokenTable() {
+  if (!pool) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tokens (
+      user_id TEXT PRIMARY KEY,
+      access_token TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
 }
-async function tokenSet(userId, token) {
-  tokens.set(userId, token);
-  if (!REDIS_CFG) return;
-  try { await redisCommand('SET', `plaid:token:${userId}`, token); } catch (_e) {}
+initTokenTable().catch(err => console.error('Token table init error:', err));
+
+async function getStoredToken(userId) {
+  if (!pool) return memTokens.get(userId) || null;
+  const r = await pool.query('SELECT access_token FROM tokens WHERE user_id=$1', [userId]);
+  return r.rows[0]?.access_token || null;
 }
-async function tokenDel(userId) {
-  tokens.delete(userId);
-  if (!REDIS_CFG) return;
-  try { await redisCommand('DEL', `plaid:token:${userId}`); } catch (_e) {}
+async function setStoredToken(userId, accessToken) {
+  if (!pool) { memTokens.set(userId, accessToken); return; }
+  await pool.query(
+    `INSERT INTO tokens (user_id, access_token)
+     VALUES ($1,$2)
+     ON CONFLICT (user_id) DO UPDATE SET access_token=EXCLUDED.access_token`,
+    [userId, accessToken]
+  );
+}
+async function deleteStoredToken(userId) {
+  if (!pool) { memTokens.delete(userId); return; }
+  await pool.query('DELETE FROM tokens WHERE user_id=$1', [userId]);
 }
 
 // ---------- Helpers ----------
@@ -196,8 +162,8 @@ async function linkTokenCreateSmart(baseReq, prods) {
   return { ...out, products_used: ['transactions'] };
 }
 async function needToken(res, userId) {
-  const token = await tokenGet(userId);
-  if (!token) json(res, 401, { error: 'NO_LINKED_ITEM_FOR_USER' });
+  const token = await getStoredToken(userId);
+  if (!token) { json(res, 401, { error: 'NO_LINKED_ITEM_FOR_USER' }); return null; }
   return token;
 }
 function safePlaid(res, fn) {
@@ -238,7 +204,7 @@ function money(n) { return Math.round((+n||0)*100)/100; }
 
 // Build KPI summary from Plaid data (best-effort)
 async function buildSummary(userId='default') {
-  const access = await tokenGet(userId);
+  const access = await getStoredToken(userId);
   if (!access) return { linked:false };
 
   const [acc, liab, inv, tx] = await Promise.all([
@@ -248,6 +214,7 @@ async function buildSummary(userId='default') {
     getTransactions(access, daysAgo(30), daysAgo(0)),
   ]);
 
+  // Accounts / Cash
   let accounts = (acc && acc.accounts) || [];
   const cashAccts = accounts.filter(a => a.type === 'depository');
   const checkingBal = cashAccts.filter(a => a.subtype === 'checking')
@@ -262,6 +229,7 @@ async function buildSummary(userId='default') {
   const cashOther= money(sum(otherCash));
   const totalCash= money(checking + savings + cashOther);
 
+  // Liabilities total due (balances outstanding)
   let totalLiabilities = 0;
   if (liab && liab.liabilities) {
     const L = liab.liabilities;
@@ -272,6 +240,7 @@ async function buildSummary(userId='default') {
     totalLiabilities = money(sum(cc) + sum(stu) + sum(mort) + sum(auto));
   }
 
+  // Investments total (institution_value if available)
   let totalInvestments = 0;
   if (inv && inv.holdings && inv.securities) {
     const holdings = inv.holdings;
@@ -285,6 +254,7 @@ async function buildSummary(userId='default') {
     })));
   }
 
+  // Transactions KPIs
   let income30 = 0, spend30 = 0, netCashFlow = 0, monthlySpend = 0, savingsRate = 0;
   if (tx && tx.transactions) {
     const t = tx.transactions;
@@ -295,7 +265,7 @@ async function buildSummary(userId='default') {
       spend30  = money(sum(t.filter(x => x.amount < 0).map(x => -x.amount)));
     }
     netCashFlow = money(income30 - spend30);
-    monthlySpend = spend30 || 2000;
+    monthlySpend = spend30 || 2000; // fallback
     savingsRate = income30 ? Math.max(0, Math.min(1, netCashFlow / income30)) : 0;
   } else {
     monthlySpend = 2000;
@@ -303,7 +273,10 @@ async function buildSummary(userId='default') {
     netCashFlow = 0;
   }
 
+  // Runway = cash / monthlySpend
   const runwayMonths = monthlySpend ? money(totalCash / monthlySpend) : 0;
+
+  // Net worth (approx) = cash + investments - liabilities
   const netWorth = money(totalCash + totalInvestments - totalLiabilities);
 
   return {
@@ -402,6 +375,7 @@ async function askGemini(prompt, system) {
 function fuseReplies(replies) {
   const texts = replies.filter(Boolean).map(s => String(s).trim()).filter(Boolean);
   if (!texts.length) return "I'm ready, but no AI providers responded. Check your AI keys.";
+  // Simple fusion: keep first, append non-duplicate sentences from others
   const first = texts[0];
   const seen = new Set(first.split(/(?<=\.)\s+/).map(s=>s.trim().toLowerCase()));
   let extra = [];
@@ -465,7 +439,7 @@ const server = http.createServer(async (req, res) => {
       const userId = body.userId || 'default';
       return safePlaid(res, async () => {
         const data = await plaidPost('/item/public_token/exchange', { public_token: body.public_token });
-        await tokenSet(userId, data.access_token);
+        await setStoredToken(userId, data.access_token);
         json(res, 200, { item_id: data.item_id, stored_for_user: userId });
       });
     }
@@ -576,15 +550,15 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    // Unlink
+    // Unlink (called by your frontend "Unlink Bank")
     if (req.method === 'POST' && path === '/plaid/unlink') {
       const body = await readJSON(req);
       const userId = (body.userId || 'default').toString();
-      const token = await tokenGet(userId);
+      const token = await getStoredToken(userId);
       if (!token) return json(res, 200, { ok:true, message:'Nothing to unlink' });
       return safePlaid(res, async () => {
         await plaidPost('/item/remove', { access_token: token });
-        await tokenDel(userId);
+        await deleteStoredToken(userId);
         json(res, 200, { ok:true });
       });
     }
@@ -593,7 +567,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && path === '/user/delete') {
       const body = await readJSON(req);
       const userId = (body.userId || 'default').toString();
-      await tokenDel(userId);
+      await deleteStoredToken(userId);
       return json(res, 200, { ok:true });
     }
 
@@ -666,5 +640,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`ACTIV backend running on :${PORT} | PLAID_ENV=${PLAID_ENV} | Redis=${REDIS_CFG?'on':'off'}`);
+  console.log(`ACTIV backend running on :${PORT} | PLAID_ENV=${PLAID_ENV}`);
 });
