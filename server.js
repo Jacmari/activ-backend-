@@ -1,5 +1,6 @@
-// server.js — ACTIV backend (Plaid + JAMARI AI Fusion) — Node 18+, minimal deps.
-// Works on Heroku. Uses built-in fetch. Production-safe CORS + error handling.
+// server.js — ACTIV backend (Plaid + JAMARI AI Fusion + Postgres persistence)
+// Node 18+, no extra frameworks. Works on Heroku.
+// Persists Plaid access_token in Postgres (DATABASE_URL). Falls back to in-memory if DB not present.
 
 const http = require('http');
 const url = require('url');
@@ -27,7 +28,7 @@ const VALID_PRODUCTS = new Set([
 ]);
 const PREFERRED_PRODUCTS = ['transactions','auth','identity','liabilities','investments'];
 
-// AI (optional — any missing key is fine; we’ll use what’s available)
+// AI (optional — any missing key is fine)
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL   = process.env.OPENAI_MODEL   || 'gpt-4o-mini';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
@@ -39,50 +40,64 @@ const GEMINI_MODEL   = process.env.GEMINI_MODEL   || 'gemini-1.5-flash';
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 const PLAID_REDIRECT_URI = process.env.PLAID_REDIRECT_URI || '';
 
-// ---------- Token storage (Postgres with in-memory fallback) ----------
-const { Pool } = require('pg');
-
-const useDb = !!process.env.DATABASE_URL;
-let pool = null;
-if (useDb) {
-  pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
-  });
+// ---------- Postgres (persistent token storage) ----------
+const USE_DB = !!process.env.DATABASE_URL;
+let pgPool = null;
+if (USE_DB) {
+  try {
+    const { Pool } = require('pg');
+    pgPool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: process.env.DATABASE_URL.includes('amazonaws.com')
+        ? { rejectUnauthorized: false }
+        : (process.env.PGSSL === 'true' ? { rejectUnauthorized: false } : false)
+    });
+    // init table
+    (async () => {
+      await pgPool.query(`
+        CREATE TABLE IF NOT EXISTS tokens (
+          user_id TEXT PRIMARY KEY,
+          access_token TEXT NOT NULL,
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+      `);
+    })().catch(err => console.error('DB init error:', err));
+  } catch (e) {
+    console.error('pg module not available, falling back to memory:', e.message);
+    pgPool = null;
+  }
 }
 
-// In-memory fallback (used only if DB not available)
+// Fallback in-memory store if DB not available
 const memTokens = new Map();
 
-async function initTokenTable() {
-  if (!pool) return;
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS tokens (
-      user_id TEXT PRIMARY KEY,
-      access_token TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
+// helpers for tokens (DB first, memory fallback)
+async function storeToken(userId, accessToken) {
+  if (pgPool) {
+    await pgPool.query(
+      `INSERT INTO tokens (user_id, access_token)
+       VALUES ($1, $2)
+       ON CONFLICT (user_id) DO UPDATE SET access_token = EXCLUDED.access_token`,
+      [userId, accessToken]
+    );
+  } else {
+    memTokens.set(userId, accessToken);
+  }
 }
-initTokenTable().catch(err => console.error('Token table init error:', err));
-
-async function getStoredToken(userId) {
-  if (!pool) return memTokens.get(userId) || null;
-  const r = await pool.query('SELECT access_token FROM tokens WHERE user_id=$1', [userId]);
-  return r.rows[0]?.access_token || null;
+async function getToken(userId) {
+  if (pgPool) {
+    const r = await pgPool.query(`SELECT access_token FROM tokens WHERE user_id=$1`, [userId]);
+    return r.rows[0]?.access_token || null;
+  } else {
+    return memTokens.get(userId) || null;
+  }
 }
-async function setStoredToken(userId, accessToken) {
-  if (!pool) { memTokens.set(userId, accessToken); return; }
-  await pool.query(
-    `INSERT INTO tokens (user_id, access_token)
-     VALUES ($1,$2)
-     ON CONFLICT (user_id) DO UPDATE SET access_token=EXCLUDED.access_token`,
-    [userId, accessToken]
-  );
-}
-async function deleteStoredToken(userId) {
-  if (!pool) { memTokens.delete(userId); return; }
-  await pool.query('DELETE FROM tokens WHERE user_id=$1', [userId]);
+async function deleteToken(userId) {
+  if (pgPool) {
+    await pgPool.query(`DELETE FROM tokens WHERE user_id=$1`, [userId]);
+  } else {
+    memTokens.delete(userId);
+  }
 }
 
 // ---------- Helpers ----------
@@ -123,7 +138,6 @@ async function plaidPost(path, body) {
   }
   return data;
 }
-function uid() { return (Date.now().toString(36) + Math.random().toString(36).slice(2)); }
 function cleanProducts(list) {
   return (list || PREFERRED_PRODUCTS)
     .map(s => String(s).trim().toLowerCase())
@@ -161,19 +175,6 @@ async function linkTokenCreateSmart(baseReq, prods) {
   const out = await plaidPost('/link/token/create', { ...baseReq, products: ['transactions'] });
   return { ...out, products_used: ['transactions'] };
 }
-async function needToken(res, userId) {
-  const token = await getStoredToken(userId);
-  if (!token) { json(res, 401, { error: 'NO_LINKED_ITEM_FOR_USER' }); return null; }
-  return token;
-}
-function safePlaid(res, fn) {
-  return fn().catch(err => {
-    console.error('Plaid error:', err);
-    const code = err?.error_code || 'PLAID_ERROR';
-    const status = (err?.http_status >= 400 && err?.http_status <= 599) ? err.http_status : 500;
-    json(res, status, { error: code, details: err });
-  });
-}
 function daysAgo(n) {
   const d = new Date(Date.now() - n*24*3600*1000);
   return d.toISOString().slice(0,10);
@@ -204,7 +205,7 @@ function money(n) { return Math.round((+n||0)*100)/100; }
 
 // Build KPI summary from Plaid data (best-effort)
 async function buildSummary(userId='default') {
-  const access = await getStoredToken(userId);
+  const access = await getToken(userId);
   if (!access) return { linked:false };
 
   const [acc, liab, inv, tx] = await Promise.all([
@@ -229,7 +230,7 @@ async function buildSummary(userId='default') {
   const cashOther= money(sum(otherCash));
   const totalCash= money(checking + savings + cashOther);
 
-  // Liabilities total due (balances outstanding)
+  // Liabilities total outstanding
   let totalLiabilities = 0;
   if (liab && liab.liabilities) {
     const L = liab.liabilities;
@@ -240,7 +241,7 @@ async function buildSummary(userId='default') {
     totalLiabilities = money(sum(cc) + sum(stu) + sum(mort) + sum(auto));
   }
 
-  // Investments total (institution_value if available)
+  // Investments total
   let totalInvestments = 0;
   if (inv && inv.holdings && inv.securities) {
     const holdings = inv.holdings;
@@ -265,7 +266,7 @@ async function buildSummary(userId='default') {
       spend30  = money(sum(t.filter(x => x.amount < 0).map(x => -x.amount)));
     }
     netCashFlow = money(income30 - spend30);
-    monthlySpend = spend30 || 2000; // fallback
+    monthlySpend = spend30 || 2000;
     savingsRate = income30 ? Math.max(0, Math.min(1, netCashFlow / income30)) : 0;
   } else {
     monthlySpend = 2000;
@@ -273,10 +274,7 @@ async function buildSummary(userId='default') {
     netCashFlow = 0;
   }
 
-  // Runway = cash / monthlySpend
   const runwayMonths = monthlySpend ? money(totalCash / monthlySpend) : 0;
-
-  // Net worth (approx) = cash + investments - liabilities
   const netWorth = money(totalCash + totalInvestments - totalLiabilities);
 
   return {
@@ -300,14 +298,13 @@ async function buildSummary(userId='default') {
   };
 }
 
-// ---------- AI Providers (best-effort, with timeouts) ----------
+// ---------- AI Providers ----------
 function withTimeout(promise, ms=14000) {
   return Promise.race([
     promise,
     new Promise((_, reject) => setTimeout(()=>reject(new Error('TIMEOUT')), ms))
   ]);
 }
-
 async function askOpenAI(prompt, system) {
   if (!OPENAI_API_KEY) return null;
   try {
@@ -331,7 +328,6 @@ async function askOpenAI(prompt, system) {
     return text || null;
   } catch { return null; }
 }
-
 async function askAnthropic(prompt, system) {
   if (!ANTHROPIC_API_KEY) return null;
   try {
@@ -354,7 +350,6 @@ async function askAnthropic(prompt, system) {
     return text || null;
   } catch { return null; }
 }
-
 async function askGemini(prompt, system) {
   if (!GEMINI_API_KEY) return null;
   try {
@@ -371,11 +366,9 @@ async function askGemini(prompt, system) {
     return text || null;
   } catch { return null; }
 }
-
 function fuseReplies(replies) {
   const texts = replies.filter(Boolean).map(s => String(s).trim()).filter(Boolean);
   if (!texts.length) return "I'm ready, but no AI providers responded. Check your AI keys.";
-  // Simple fusion: keep first, append non-duplicate sentences from others
   const first = texts[0];
   const seen = new Set(first.split(/(?<=\.)\s+/).map(s=>s.trim().toLowerCase()));
   let extra = [];
@@ -401,17 +394,16 @@ const server = http.createServer(async (req, res) => {
   try {
     // Health
     if (req.method === 'GET' && path === '/') {
-      return json(res, 200, { ok:true, env: PLAID_ENV, countries: COUNTRY_CODES });
+      return json(res, 200, { ok:true, env: PLAID_ENV, db: !!pgPool, countries: COUNTRY_CODES });
     }
-    // Frontend calls this
     if (req.method === 'GET' && path === '/ping') {
-      return json(res, 200, { ok:true, env: PLAID_ENV });
+      return json(res, 200, { ok:true, env: PLAID_ENV, db: !!pgPool });
     }
 
     // Create Link Token (accept user_id or userId)
     if (req.method === 'POST' && path === '/plaid/link_token/create') {
       const body = await readJSON(req);
-      const userId = body.userId || body.user_id || 'default';
+      const userId = (body.userId || body.user_id || 'default').toString();
       const baseReq = {
         user: { client_user_id: userId },
         client_name: 'ACTIV',
@@ -421,153 +413,201 @@ const server = http.createServer(async (req, res) => {
       if (PLAID_REDIRECT_URI) baseReq.redirect_uri = PLAID_REDIRECT_URI;
       if (WEBHOOK_URL) baseReq.webhook = WEBHOOK_URL;
 
-      return safePlaid(res, async () => {
-        const data = await linkTokenCreateSmart(baseReq, body.products || PREFERRED_PRODUCTS);
-        json(res, 200, {
-          link_token: data.link_token,
-          expiration: data.expiration,
-          userId,
-          products_used: data.products_used
-        });
-      });
+      return (async () => {
+        try {
+          const data = await linkTokenCreateSmart(baseReq, body.products || PREFERRED_PRODUCTS);
+          json(res, 200, {
+            link_token: data.link_token,
+            expiration: data.expiration,
+            userId,
+            products_used: data.products_used
+          });
+        } catch (err) {
+          const status = err?.http_status || 500;
+          json(res, status, { error: err?.error_code || 'PLAID_ERROR', details: err });
+        }
+      })();
     }
 
     // Exchange public_token
     if (req.method === 'POST' && path === '/plaid/exchange_public_token') {
       const body = await readJSON(req);
       if (!body.public_token) return json(res, 400, { error: 'MISSING_PUBLIC_TOKEN' });
-      const userId = body.userId || 'default';
-      return safePlaid(res, async () => {
+      const userId = (body.userId || 'default').toString();
+      try {
         const data = await plaidPost('/item/public_token/exchange', { public_token: body.public_token });
-        await setStoredToken(userId, data.access_token);
-        json(res, 200, { item_id: data.item_id, stored_for_user: userId });
-      });
+        await storeToken(userId, data.access_token);
+        return json(res, 200, { item_id: data.item_id, stored_for_user: userId });
+      } catch (err) {
+        const status = err?.http_status || 500;
+        return json(res, status, { error: err?.error_code || 'PLAID_ERROR', details: err });
+      }
     }
 
     // Accounts + Balances
     if (req.method === 'GET' && path === '/plaid/accounts') {
       const userId = (parsed.query.userId || 'default').toString();
-      const token = await needToken(res, userId); if (!token) return;
-      return safePlaid(res, async () => {
+      const token = await getToken(userId);
+      if (!token) return json(res, 401, { error: 'NO_LINKED_ITEM_FOR_USER' });
+      try {
         const data = await plaidPost('/accounts/balance/get', { access_token: token });
-        json(res, 200, data);
-      });
+        return json(res, 200, data);
+      } catch (err) {
+        const status = err?.http_status || 500;
+        return json(res, status, { error: err?.error_code || 'PLAID_ERROR', details: err });
+      }
     }
-    // Alias
+    // Alias for balances
     if (req.method === 'GET' && path === '/plaid/balances') {
       const userId = (parsed.query.userId || 'default').toString();
-      const token = await needToken(res, userId); if (!token) return;
-      return safePlaid(res, async () => {
+      const token = await getToken(userId);
+      if (!token) return json(res, 401, { error: 'NO_LINKED_ITEM_FOR_USER' });
+      try {
         const data = await plaidPost('/accounts/balance/get', { access_token: token });
-        json(res, 200, data);
-      });
+        return json(res, 200, data);
+      } catch (err) {
+        const status = err?.http_status || 500;
+        return json(res, status, { error: err?.error_code || 'PLAID_ERROR', details: err });
+      }
     }
 
     // Transactions (range)
     if (req.method === 'GET' && path === '/plaid/transactions') {
       const userId = (parsed.query.userId || 'default').toString();
-      const token = await needToken(res, userId); if (!token) return;
+      const token = await getToken(userId);
+      if (!token) return json(res, 401, { error: 'NO_LINKED_ITEM_FOR_USER' });
       const end = (parsed.query.end || daysAgo(0));
       const start = (parsed.query.start || daysAgo(30));
-      return safePlaid(res, async () => {
+      try {
         const data = await plaidPost('/transactions/get', {
           access_token: token, start_date: start, end_date: end, options: { count: 250, offset: 0 }
         });
-        json(res, 200, data);
-      });
+        return json(res, 200, data);
+      } catch (err) {
+        const status = err?.http_status || 500;
+        return json(res, status, { error: err?.error_code || 'PLAID_ERROR', details: err });
+      }
     }
     // Transactions Sync
     if (req.method === 'POST' && path === '/plaid/transactions/sync') {
       const body = await readJSON(req);
       const userId = (body.userId || 'default').toString();
-      const token = await needToken(res, userId); if (!token) return;
+      const token = await getToken(userId);
+      if (!token) return json(res, 401, { error: 'NO_LINKED_ITEM_FOR_USER' });
       const cursor = body.cursor || null;
-      return safePlaid(res, async () => {
+      try {
         const data = await plaidPost('/transactions/sync', { access_token: token, cursor, count: 500 });
-        json(res, 200, data);
-      });
+        return json(res, 200, data);
+      } catch (err) {
+        const status = err?.http_status || 500;
+        return json(res, status, { error: err?.error_code || 'PLAID_ERROR', details: err });
+      }
     }
 
     // Liabilities
     if (req.method === 'GET' && path === '/plaid/liabilities') {
       const userId = (parsed.query.userId || 'default').toString();
-      const token = await needToken(res, userId); if (!token) return;
-      return safePlaid(res, async () => {
+      const token = await getToken(userId);
+      if (!token) return json(res, 401, { error: 'NO_LINKED_ITEM_FOR_USER' });
+      try {
         const data = await plaidPost('/liabilities/get', { access_token: token });
-        json(res, 200, data);
-      });
+        return json(res, 200, data);
+      } catch (err) {
+        const status = err?.http_status || 500;
+        return json(res, status, { error: err?.error_code || 'PLAID_ERROR', details: err });
+      }
     }
 
     // Investments
     if (req.method === 'GET' && path === '/plaid/investments/holdings') {
       const userId = (parsed.query.userId || 'default').toString();
-      const token = await needToken(res, userId); if (!token) return;
-      return safePlaid(res, async () => {
+      const token = await getToken(userId);
+      if (!token) return json(res, 401, { error: 'NO_LINKED_ITEM_FOR_USER' });
+      try {
         const data = await plaidPost('/investments/holdings/get', { access_token: token });
-        json(res, 200, data);
-      });
+        return json(res, 200, data);
+      } catch (err) {
+        const status = err?.http_status || 500;
+        return json(res, status, { error: err?.error_code || 'PLAID_ERROR', details: err });
+      }
     }
     if (req.method === 'GET' && path === '/plaid/investments/transactions') {
       const userId = (parsed.query.userId || 'default').toString();
-      const token = await needToken(res, userId); if (!token) return;
+      const token = await getToken(userId);
+      if (!token) return json(res, 401, { error: 'NO_LINKED_ITEM_FOR_USER' });
       const end = (parsed.query.end || daysAgo(0));
       const start = (parsed.query.start || daysAgo(90));
-      return safePlaid(res, async () => {
+      try {
         const data = await plaidPost('/investments/transactions/get', {
           access_token: token, start_date: start, end_date: end
         });
-        json(res, 200, data);
-      });
+        return json(res, 200, data);
+      } catch (err) {
+        const status = err?.http_status || 500;
+        return json(res, status, { error: err?.error_code || 'PLAID_ERROR', details: err });
+      }
     }
 
     // Auth
     if (req.method === 'GET' && path === '/plaid/auth') {
       const userId = (parsed.query.userId || 'default').toString();
-      const token = await needToken(res, userId); if (!token) return;
-      return safePlaid(res, async () => {
+      const token = await getToken(userId);
+      if (!token) return json(res, 401, { error: 'NO_LINKED_ITEM_FOR_USER' });
+      try {
         const data = await plaidPost('/auth/get', { access_token: token });
-        json(res, 200, data);
-      });
+        return json(res, 200, data);
+      } catch (err) {
+        const status = err?.http_status || 500;
+        return json(res, status, { error: err?.error_code || 'PLAID_ERROR', details: err });
+      }
     }
 
     // Identity
     if (req.method === 'GET' && path === '/plaid/identity') {
       const userId = (parsed.query.userId || 'default').toString();
-      const token = await needToken(res, userId); if (!token) return;
-      return safePlaid(res, async () => {
+      const token = await getToken(userId);
+      if (!token) return json(res, 401, { error: 'NO_LINKED_ITEM_FOR_USER' });
+      try {
         const data = await plaidPost('/identity/get', { access_token: token });
-        json(res, 200, data);
-      });
+        return json(res, 200, data);
+      } catch (err) {
+        const status = err?.http_status || 500;
+        return json(res, status, { error: err?.error_code || 'PLAID_ERROR', details: err });
+      }
     }
 
-    // Item
+    // Item info
     if (req.method === 'GET' && path === '/plaid/item') {
       const userId = (parsed.query.userId || 'default').toString();
-      const token = await needToken(res, userId); if (!token) return;
-      return safePlaid(res, async () => {
+      const token = await getToken(userId);
+      if (!token) return json(res, 401, { error: 'NO_LINKED_ITEM_FOR_USER' });
+      try {
         const data = await plaidPost('/item/get', { access_token: token });
-        json(res, 200, data);
-      });
+        return json(res, 200, data);
+      } catch (err) {
+        const status = err?.http_status || 500;
+        return json(res, status, { error: err?.error_code || 'PLAID_ERROR', details: err });
+      }
     }
 
-    // Unlink (called by your frontend "Unlink Bank")
+    // Unlink (called by frontend)
     if (req.method === 'POST' && path === '/plaid/unlink') {
       const body = await readJSON(req);
       const userId = (body.userId || 'default').toString();
-      const token = await getStoredToken(userId);
+      const token = await getToken(userId);
       if (!token) return json(res, 200, { ok:true, message:'Nothing to unlink' });
-      return safePlaid(res, async () => {
+      try {
         await plaidPost('/item/remove', { access_token: token });
-        await deleteStoredToken(userId);
-        json(res, 200, { ok:true });
-      });
+      } catch (_) { /* ignore if already invalid */ }
+      await deleteToken(userId);
+      return json(res, 200, { ok:true });
     }
 
-    // Delete account (purge backend memory for this user)
+    // Delete account (purge backend memory/db for this user)
     if (req.method === 'POST' && path === '/user/delete') {
       const body = await readJSON(req);
       const userId = (body.userId || 'default').toString();
-      await deleteStoredToken(userId);
+      await deleteToken(userId);
       return json(res, 200, { ok:true });
     }
 
@@ -640,5 +680,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`ACTIV backend running on :${PORT} | PLAID_ENV=${PLAID_ENV}`);
+  console.log(`ACTIV backend running on :${PORT} | PLAID_ENV=${PLAID_ENV} | DB=${!!pgPool}`);
 });
