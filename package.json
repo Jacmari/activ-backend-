@@ -1,157 +1,22 @@
 {
   "info": {
-    "_postman_id": "a7b9d7fc-2d59-4d8e-9f3e-activ-plaid",
-    "name": "ACTIV Backend (Plaid) — Full",
+    "_postman_id": "c3a0a3bf-1c7e-4c5c-9e0d-9b2c1f0a3ddd",
+    "name": "ACTIV Backend (Plaid + JAMARI AI) — Postman",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
-    "description": "Covers balances, transactions (+sync +recurring), investments, liabilities, enrich, item remove, unlink, and health."
+    "description": "Set {{baseUrl}} to your Heroku URL."
   },
   "item": [
-    {
-      "name": "Ping",
-      "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/ping", "host": ["{{baseUrl}}"], "path": ["ping"] } }
-    },
-    {
-      "name": "Create Link Token",
-      "request": {
-        "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": { "mode": "raw", "raw": "{\n  \"user_id\": \"demo-user-1\"\n}" },
-        "url": { "raw": "{{baseUrl}}/plaid/link_token/create", "host": ["{{baseUrl}}"], "path": ["plaid","link_token","create"] }
-      }
-    },
-    {
-      "name": "Exchange Public Token",
-      "request": {
-        "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": { "mode": "raw", "raw": "{\n  \"public_token\": \"REPLACE_WITH_PUBLIC_TOKEN\",\n  \"user_id\": \"demo-user-1\"\n}" },
-        "url": { "raw": "{{baseUrl}}/plaid/exchange_public_token", "host": ["{{baseUrl}}"], "path": ["plaid","exchange_public_token"] }
-      }
-    },
-    {
-      "name": "Accounts + Balances",
-      "request": {
-        "method": "GET",
-        "url": { "raw": "{{baseUrl}}/plaid/accounts?userId=demo-user-1", "host": ["{{baseUrl}}"], "path": ["plaid","accounts"], "query": [{ "key": "userId", "value": "demo-user-1" }] }
-      }
-    },
-    {
-      "name": "Balances (alias)",
-      "request": {
-        "method": "GET",
-        "url": { "raw": "{{baseUrl}}/plaid/balances?userId=demo-user-1", "host": ["{{baseUrl}}"], "path": ["plaid","balances"], "query": [{ "key": "userId", "value": "demo-user-1" }] }
-      }
-    },
-    {
-      "name": "Transactions (date range)",
-      "request": {
-        "method": "GET",
-        "url": {
-          "raw": "{{baseUrl}}/plaid/transactions?userId=demo-user-1&start=2025-06-01&end=2025-08-27",
-          "host": ["{{baseUrl}}"],
-          "path": ["plaid","transactions"],
-          "query": [
-            { "key": "userId", "value": "demo-user-1" },
-            { "key": "start", "value": "2025-06-01" },
-            { "key": "end", "value": "2025-08-27" }
-          ]
-        }
-      }
-    },
-    {
-      "name": "Transactions Sync",
-      "request": {
-        "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": { "mode": "raw", "raw": "{\n  \"userId\": \"demo-user-1\",\n  \"cursor\": null\n}" },
-        "url": { "raw": "{{baseUrl}}/plaid/transactions/sync", "host": ["{{baseUrl}}"], "path": ["plaid","transactions","sync"] }
-      }
-    },
-    {
-      "name": "Recurring Transactions",
-      "request": {
-        "method": "GET",
-        "url": { "raw": "{{baseUrl}}/plaid/transactions/recurring?userId=demo-user-1", "host": ["{{baseUrl}}"], "path": ["plaid","transactions","recurring"], "query": [{ "key": "userId", "value": "demo-user-1" }] }
-      }
-    },
-    {
-      "name": "Liabilities",
-      "request": {
-        "method": "GET",
-        "url": { "raw": "{{baseUrl}}/plaid/liabilities?userId=demo-user-1", "host": ["{{baseUrl}}"], "path": ["plaid","liabilities"], "query": [{ "key": "userId", "value": "demo-user-1" }] }
-      }
-    },
-    {
-      "name": "Investments — Holdings",
-      "request": {
-        "method": "GET",
-        "url": { "raw": "{{baseUrl}}/plaid/investments/holdings?userId=demo-user-1", "host": ["{{baseUrl}}"], "path": ["plaid","investments","holdings"], "query": [{ "key": "userId", "value": "demo-user-1" }] }
-      }
-    },
-    {
-      "name": "Investments — Transactions",
-      "request": {
-        "method": "GET",
-        "url": {
-          "raw": "{{baseUrl}}/plaid/investments/transactions?userId=demo-user-1&start=2025-05-29&end=2025-08-27",
-          "host": ["{{baseUrl}}"],
-          "path": ["plaid","investments","transactions"],
-          "query": [
-            { "key": "userId", "value": "demo-user-1" },
-            { "key": "start", "value": "2025-05-29" },
-            { "key": "end", "value": "2025-08-27" }
-          ]
-        }
-      }
-    },
-    {
-      "name": "Enrich",
-      "request": {
-        "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"userId\": \"demo-user-1\",\n  \"transactions\": [\n    { \"id\": \"1\", \"description\": \"STARBUCKS\", \"amount\": 5.45, \"datetime\": \"2025-08-25T12:00:00Z\" }\n  ]\n}"
-        },
-        "url": { "raw": "{{baseUrl}}/plaid/transactions/enrich", "host": ["{{baseUrl}}"], "path": ["plaid","transactions","enrich"] }
-      }
-    },
-    {
-      "name": "Item Info",
-      "request": {
-        "method": "GET",
-        "url": { "raw": "{{baseUrl}}/plaid/item?userId=demo-user-1", "host": ["{{baseUrl}}"], "path": ["plaid","item"], "query": [{ "key": "userId", "value": "demo-user-1" }] }
-      }
-    },
-    {
-      "name": "Item Remove",
-      "request": {
-        "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": { "mode": "raw", "raw": "{\n  \"userId\": \"demo-user-1\"\n}" },
-        "url": { "raw": "{{baseUrl}}/plaid/item/remove", "host": ["{{baseUrl}}"], "path": ["plaid","item","remove"] }
-      }
-    },
-    {
-      "name": "Unlink (alias)",
-      "request": {
-        "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": { "mode": "raw", "raw": "{\n  \"userId\": \"demo-user-1\"\n}" },
-        "url": { "raw": "{{baseUrl}}/plaid/unlink", "host": ["{{baseUrl}}"], "path": ["plaid","unlink"] }
-      }
-    },
-    {
-      "name": "Delete Account",
-      "request": {
-        "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": { "mode": "raw", "raw": "{\n  \"userId\": \"demo-user-1\"\n}" },
-        "url": { "raw": "{{baseUrl}}/user/delete", "host": ["{{baseUrl}}"], "path": ["user","delete"] }
-      }
-    }
+    { "name": "Ping", "request": { "method": "GET", "header": [], "url": { "raw": "{{baseUrl}}/ping", "host": ["{{baseUrl}}"], "path": ["ping"] } } },
+    { "name": "Create Link Token", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"userId\": \"default\",\n  \"products\": [\"transactions\",\"auth\",\"identity\",\"liabilities\",\"investments\"]\n}" }, "url": { "raw": "{{baseUrl}}/plaid/link_token/create", "host": ["{{baseUrl}}"], "path": ["plaid","link_token","create"] } } },
+    { "name": "Exchange Public Token", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"public_token\": \"REPLACE\",\n  \"userId\": \"default\"\n}" }, "url": { "raw": "{{baseUrl}}/plaid/exchange_public_token", "host": ["{{baseUrl}}"], "path": ["plaid","exchange_public_token"] } } },
+    { "name": "Balances", "request": { "method": "GET", "header": [], "url": { "raw": "{{baseUrl}}/plaid/balances?userId=default", "host": ["{{baseUrl}}"], "path": ["plaid","balances"], "query": [{ "key": "userId", "value": "default" }] } } },
+    { "name": "Transactions (30d)", "request": { "method": "GET", "header": [], "url": { "raw": "{{baseUrl}}/plaid/transactions?userId=default", "host": ["{{baseUrl}}"], "path": ["plaid","transactions"], "query": [{ "key": "userId", "value": "default" }] } } },
+    { "name": "Liabilities", "request": { "method": "GET", "header": [], "url": { "raw": "{{baseUrl}}/plaid/liabilities?userId=default", "host": ["{{baseUrl}}"], "path": ["plaid","liabilities"], "query": [{ "key": "userId", "value": "default" }] } } },
+    { "name": "Investments — Holdings", "request": { "method": "GET", "header": [], "url": { "raw": "{{baseUrl}}/plaid/investments/holdings?userId=default", "host": ["{{baseUrl}}"], "path": ["plaid","investments","holdings"], "query": [{ "key": "userId", "value": "default" }] } } },
+    { "name": "Summary (KPIs)", "request": { "method": "GET", "header": [], "url": { "raw": "{{baseUrl}}/summary?userId=default", "host": ["{{baseUrl}}"], "path": ["summary"], "query": [{ "key": "userId", "value": "default" }] } } },
+    { "name": "JAMARI Chat", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"userId\": \"default\",\n  \"message\": \"Can I spend $300 on a weekend trip?\"\n}" }, "url": { "raw": "{{baseUrl}}/jamari/chat", "host": ["{{baseUrl}}"], "path": ["jamari","chat"] } } },
+    { "name": "Unlink Bank", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"userId\": \"default\"\n}" }, "url": { "raw": "{{baseUrl}}/plaid/unlink", "host": ["{{baseUrl}}"], "path": ["plaid","unlink"] } } },
+    { "name": "Delete Account", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\n  \"userId\": \"default\"\n}" }, "url": { "raw": "{{baseUrl}}/user/delete", "host": ["{{baseUrl}}"], "path": ["user","delete"] } } }
   ],
-  "variable": [
-    { "key": "baseUrl", "value": "https://YOUR-HEROKU-APP.herokuapp.com", "type": "string" }
-  ]
+  "variable": [{ "key": "baseUrl", "value": "https://YOUR-HEROKU-APP.herokuapp.com", "type": "string" }]
 }
