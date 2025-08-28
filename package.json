@@ -1,118 +1,15 @@
 {
-  "info": {
-    "name": "ACTIV Banking Backend",
-    "_postman_id": "abcd1234-5678-90ef-ghij-klmnopqrstuv",
-    "description": "Postman collection for testing ACTIV Banking backend (Plaid + JAMARI AI Fusion).",
-    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  "name": "activ-backend",
+  "version": "1.0.0",
+  "description": "ACTIV backend (Plaid + JAMARI AI Fusion) with Postgres token persistence",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
   },
-  "item": [
-    {
-      "name": "Ping Backend",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": "{{BASE_URL}}/ping"
-      }
-    },
-    {
-      "name": "Create Link Token",
-      "request": {
-        "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"userId\": \"default\"\n}"
-        },
-        "url": "{{BASE_URL}}/plaid/link_token/create"
-      }
-    },
-    {
-      "name": "Exchange Public Token",
-      "request": {
-        "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"public_token\": \"{{PUBLIC_TOKEN}}\",\n  \"userId\": \"default\"\n}"
-        },
-        "url": "{{BASE_URL}}/plaid/exchange_public_token"
-      }
-    },
-    {
-      "name": "Accounts / Balances",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": "{{BASE_URL}}/plaid/accounts?userId=default"
-      }
-    },
-    {
-      "name": "Liabilities",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": "{{BASE_URL}}/plaid/liabilities?userId=default"
-      }
-    },
-    {
-      "name": "Investments Holdings",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": "{{BASE_URL}}/plaid/investments/holdings?userId=default"
-      }
-    },
-    {
-      "name": "Investments Transactions",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": "{{BASE_URL}}/plaid/investments/transactions?userId=default"
-      }
-    },
-    {
-      "name": "Transactions (30d)",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": "{{BASE_URL}}/plaid/transactions?userId=default"
-      }
-    },
-    {
-      "name": "Summary KPIs",
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": "{{BASE_URL}}/summary?userId=default"
-      }
-    },
-    {
-      "name": "JAMARI Chat",
-      "request": {
-        "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"userId\": \"default\",\n  \"message\": \"How is my net worth doing this month?\"\n}"
-        },
-        "url": "{{BASE_URL}}/jamari/chat"
-      }
-    },
-    {
-      "name": "Unlink Bank",
-      "request": {
-        "method": "POST",
-        "header": [{ "key": "Content-Type", "value": "application/json" }],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"userId\": \"default\"\n}"
-        },
-        "url": "{{BASE_URL}}/plaid/unlink"
-      }
-    }
-  ],
-  "variable": [
-    { "key": "BASE_URL", "value": "https://YOUR-HEROKU-APP.herokuapp.com" },
-    { "key": "PUBLIC_TOKEN", "value": "" }
-  ]
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "pg": "^8.11.5"
+  }
 }
