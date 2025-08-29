@@ -1,8 +1,6 @@
-// server.js — ACTIV backend (Plaid + JAMARI AI Fusion) — Node 18+
-//
-// Upgrade: Postgres-backed token store with AUTO-CREATE (no manual SQL).
-// If the tokens table doesn't exist, it's created on boot.
-// Rest of the API is unchanged.
+// server.js — ACTIV backend (Plaid + JAMARI AI Fusion) — Node 18+, no npm deps.
+// Works on Heroku. Uses built-in fetch. Production-safe CORS + error handling.
+// Adds Postgres persistent token storage and GET fallback for link token.
 
 const http = require('http');
 const url = require('url');
@@ -31,7 +29,7 @@ const VALID_PRODUCTS = new Set([
 const PREFERRED_PRODUCTS = ['transactions','auth','identity','liabilities','investments'];
 
 // AI (optional)
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPEN_API_KEY || '';
 const OPENAI_MODEL   = process.env.OPENAI_MODEL   || 'gpt-4o-mini';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const ANTHROPIC_MODEL   = process.env.ANTHROPIC_MODEL   || 'claude-3-haiku-20240307';
@@ -42,62 +40,53 @@ const GEMINI_MODEL   = process.env.GEMINI_MODEL   || 'gemini-1.5-flash';
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 const PLAID_REDIRECT_URI = process.env.PLAID_REDIRECT_URI || '';
 
-// ---------- Postgres (auto-init) ----------
-const { Pool } = require('pg');
+// ---------- Postgres (persistent tokens) ----------
 const DATABASE_URL = process.env.DATABASE_URL || '';
-let pool = null;
-let dbReady = false;
+let pgPool = null;
+if (DATABASE_URL) {
+  const { Pool } = require('pg');
+  pgPool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+    max: 3,
+    idleTimeoutMillis: 120000
+  });
+}
 
 async function dbInit() {
-  if (!DATABASE_URL) {
-    console.warn('DATABASE_URL missing — tokens will only be in-memory.');
-    return;
-  }
-  pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
-
-  // Create table if not exists (covers your prior error: column item_id / relation missing)
-  const createSQL = `
-    CREATE TABLE IF NOT EXISTS tokens (
-      user_id           TEXT PRIMARY KEY,
-      access_token      TEXT NOT NULL,
-      item_id           TEXT NOT NULL,
-      institution_name  TEXT,
-      created_at        TIMESTAMPTZ DEFAULT now()
-    );
+  if (!pgPool) return false;
+  const sql = `
+  CREATE TABLE IF NOT EXISTS plaid_tokens (
+    user_id TEXT PRIMARY KEY,
+    access_token TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    institution_name TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+  );
   `;
-  await pool.query(createSQL);
-  dbReady = true;
-  console.log('DB ready: tokens table ensured.');
+  await pgPool.query(sql);
+  return true;
 }
-
-async function dbGetToken(userId) {
-  if (!dbReady) return null;
-  const r = await pool.query('SELECT access_token FROM tokens WHERE user_id = $1 LIMIT 1', [userId]);
+async function dbSetToken({ user_id, access_token, item_id, institution_name }) {
+  if (!pgPool) return;
+  await pgPool.query(
+    `INSERT INTO plaid_tokens (user_id, access_token, item_id, institution_name)
+     VALUES ($1,$2,$3,$4)
+     ON CONFLICT (user_id) DO UPDATE SET access_token=EXCLUDED.access_token, item_id=EXCLUDED.item_id, institution_name=EXCLUDED.institution_name`,
+    [user_id, access_token, item_id, institution_name || null]
+  );
+}
+async function dbGetToken(user_id) {
+  if (!pgPool) return null;
+  const r = await pgPool.query(`SELECT access_token FROM plaid_tokens WHERE user_id=$1`, [user_id]);
   return r.rows[0]?.access_token || null;
 }
-
-async function dbSetToken({ userId, access_token, item_id, institution_name }) {
-  if (!dbReady) return false;
-  await pool.query(
-    `INSERT INTO tokens (user_id, access_token, item_id, institution_name)
-     VALUES ($1,$2,$3,$4)
-     ON CONFLICT (user_id) DO UPDATE SET
-       access_token = EXCLUDED.access_token,
-       item_id = EXCLUDED.item_id,
-       institution_name = EXCLUDED.institution_name,
-       created_at = now()`,
-    [userId, access_token, item_id, institution_name || null]
-  );
-  return true;
+async function dbDeleteToken(user_id) {
+  if (!pgPool) return;
+  await pgPool.query(`DELETE FROM plaid_tokens WHERE user_id=$1`, [user_id]);
 }
 
-async function dbDeleteToken(userId) {
-  if (!dbReady) return false;
-  await pool.query('DELETE FROM tokens WHERE user_id = $1', [userId]);
-  return true;
-}
-
-// ---------- Simple in-memory token cache (mirrors DB) ----------
+// ---------- Simple in-memory fallback (warm cache) ----------
 const tokens = new Map();
 
 // ---------- Helpers ----------
@@ -177,17 +166,23 @@ async function linkTokenCreateSmart(baseReq, prods) {
   return { ...out, products_used: ['transactions'] };
 }
 async function getStoredToken(userId) {
-  // prefer cache
-  if (tokens.has(userId)) return tokens.get(userId);
-  // fallback to DB
-  const t = await dbGetToken(userId);
-  if (t) tokens.set(userId, t);
-  return t;
+  // memory first, then DB
+  const mem = tokens.get(userId);
+  if (mem) return mem;
+  const dbTok = await dbGetToken(userId);
+  if (dbTok) { tokens.set(userId, dbTok); return dbTok; }
+  return null;
+}
+function needToken(res, userId) {
+  // NOTE: this function is kept for flow, but we use async getStoredToken in routes.
+  const token = tokens.get(userId);
+  if (!token) json(res, 401, { error: 'NO_LINKED_ITEM_FOR_USER' });
+  return token;
 }
 function safePlaid(res, fn) {
   return fn().catch(err => {
     console.error('Plaid error:', err);
-    const code = err?.error_code || err?.error || 'PLAID_ERROR';
+    const code = err?.error_code || 'PLAID_ERROR';
     const status = (err?.http_status >= 400 && err?.http_status <= 599) ? err.http_status : 500;
     json(res, status, { error: code, details: err });
   });
@@ -247,7 +242,7 @@ async function buildSummary(userId='default') {
   const cashOther= money(sum(otherCash));
   const totalCash= money(checking + savings + cashOther);
 
-  // Liabilities total due (balances outstanding)
+  // Liabilities total due
   let totalLiabilities = 0;
   if (liab && liab.liabilities) {
     const L = liab.liabilities;
@@ -258,7 +253,7 @@ async function buildSummary(userId='default') {
     totalLiabilities = money(sum(cc) + sum(stu) + sum(mort) + sum(auto));
   }
 
-  // Investments total
+  // Investments total (institution_value if available)
   let totalInvestments = 0;
   if (inv && inv.holdings && inv.securities) {
     const holdings = inv.holdings;
@@ -286,10 +281,15 @@ async function buildSummary(userId='default') {
     monthlySpend = spend30 || 2000;
     savingsRate = income30 ? Math.max(0, Math.min(1, netCashFlow / income30)) : 0;
   } else {
-    monthlySpend = 2000; savingsRate = 0.20; netCashFlow = 0;
+    monthlySpend = 2000;
+    savingsRate = 0.20;
+    netCashFlow = 0;
   }
 
+  // Runway = cash / monthlySpend
   const runwayMonths = monthlySpend ? money(totalCash / monthlySpend) : 0;
+
+  // Net worth
   const netWorth = money(totalCash + totalInvestments - totalLiabilities);
 
   return {
@@ -344,6 +344,7 @@ async function askOpenAI(prompt, system) {
     return text || null;
   } catch { return null; }
 }
+
 async function askAnthropic(prompt, system) {
   if (!ANTHROPIC_API_KEY) return null;
   try {
@@ -366,6 +367,7 @@ async function askAnthropic(prompt, system) {
     return text || null;
   } catch { return null; }
 }
+
 async function askGemini(prompt, system) {
   if (!GEMINI_API_KEY) return null;
   try {
@@ -382,6 +384,7 @@ async function askGemini(prompt, system) {
     return text || null;
   } catch { return null; }
 }
+
 function fuseReplies(replies) {
   const texts = replies.filter(Boolean).map(s => String(s).trim()).filter(Boolean);
   if (!texts.length) return "I'm ready, but no AI providers responded. Check your AI keys.";
@@ -408,15 +411,16 @@ const server = http.createServer(async (req, res) => {
   const path = parsed.pathname;
 
   try {
-    // Health
+    // health
     if (req.method === 'GET' && path === '/') {
-      return json(res, 200, { ok:true, env: PLAID_ENV, db: !!DATABASE_URL, dbReady });
+      const dbReady = await dbInit().catch(()=>false);
+      return json(res, 200, { ok:true, env: PLAID_ENV, db: !!pgPool, dbReady });
     }
     if (req.method === 'GET' && path === '/ping') {
       return json(res, 200, { ok:true, env: PLAID_ENV });
     }
 
-    // Create Link Token
+    // Create Link Token (POST)
     if (req.method === 'POST' && path === '/plaid/link_token/create') {
       const body = await readJSON(req);
       const userId = body.userId || body.user_id || 'default';
@@ -440,25 +444,46 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    // Exchange public_token
+    // Create Link Token (GET fallback)  <<<<<< NEW
+    if (req.method === 'GET' && path === '/plaid/link_token/new') {
+      const userId = (parsed.query.userId || 'default').toString();
+      const baseReq = {
+        user: { client_user_id: userId },
+        client_name: 'ACTIV',
+        language: 'en',
+        country_codes: COUNTRY_CODES,
+      };
+      if (PLAID_REDIRECT_URI) baseReq.redirect_uri = PLAID_REDIRECT_URI;
+      if (WEBHOOK_URL) baseReq.webhook = WEBHOOK_URL;
+
+      return safePlaid(res, async () => {
+        const data = await linkTokenCreateSmart(baseReq, PREFERRED_PRODUCTS);
+        json(res, 200, {
+          link_token: data.link_token,
+          expiration: data.expiration,
+          userId,
+          products_used: data.products_used
+        });
+      });
+    }
+
+    // Exchange public_token -> store access_token (DB + memory)
     if (req.method === 'POST' && path === '/plaid/exchange_public_token') {
       const body = await readJSON(req);
       if (!body.public_token) return json(res, 400, { error: 'MISSING_PUBLIC_TOKEN' });
       const userId = body.userId || 'default';
       return safePlaid(res, async () => {
         const data = await plaidPost('/item/public_token/exchange', { public_token: body.public_token });
-        // cache + DB
         tokens.set(userId, data.access_token);
         try {
-          await dbSetToken({
-            userId,
-            access_token: data.access_token,
-            item_id: data.item_id || 'unknown',
-            institution_name: body.institution_name || null
-          });
-        } catch (e) {
-          console.error('dbSetToken', e);
-        }
+          // item/get to grab institution_name (best-effort)
+          let inst = null;
+          try {
+            const item = await plaidPost('/item/get', { access_token: data.access_token });
+            inst = item?.item?.institution_id || null;
+          } catch {}
+          await dbSetToken({ user_id:userId, access_token:data.access_token, item_id:data.item_id, institution_name:inst });
+        } catch (e) { console.error('dbSetToken error:', e); }
         json(res, 200, { item_id: data.item_id, stored_for_user: userId });
       });
     }
@@ -473,6 +498,7 @@ const server = http.createServer(async (req, res) => {
         json(res, 200, data);
       });
     }
+    // Alias
     if (req.method === 'GET' && path === '/plaid/balances') {
       const userId = (parsed.query.userId || 'default').toString();
       const token = await getStoredToken(userId);
@@ -587,17 +613,17 @@ const server = http.createServer(async (req, res) => {
       return safePlaid(res, async () => {
         await plaidPost('/item/remove', { access_token: token });
         tokens.delete(userId);
-        try { await dbDeleteToken(userId); } catch (_) {}
+        await dbDeleteToken(userId).catch(()=>{});
         json(res, 200, { ok:true });
       });
     }
 
-    // Delete account (purge backend memory for this user)
+    // Delete account (purge backend memory & DB)
     if (req.method === 'POST' && path === '/user/delete') {
       const body = await readJSON(req);
       const userId = (body.userId || 'default').toString();
       tokens.delete(userId);
-      try { await dbDeleteToken(userId); } catch (_) {}
+      await dbDeleteToken(userId).catch(()=>{});
       return json(res, 200, { ok:true });
     }
 
@@ -669,11 +695,8 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, async () => {
-  try {
-    await dbInit();
-  } catch (e) {
-    console.error('DB init failed:', e);
-  }
-  console.log(`ACTIV backend running on :${PORT} | PLAID_ENV=${PLAID_ENV} | dbReady=${dbReady}`);
+dbInit().catch(e=>console.error('dbInit error', e));
+
+server.listen(PORT, () => {
+  console.log(`ACTIV backend running on :${PORT} | PLAID_ENV=${PLAID_ENV}`);
 });
