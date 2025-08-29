@@ -1,7 +1,9 @@
-// ACTIV backend (Plaid + JAMARI Fusion) — plain Node.js (no external deps)
+// server.js — ACTIV backend (Plaid + JAMARI AI Fusion) with persistence + multi-user support
+// Node 18+, no npm deps except pg (Postgres client)
 
 const http = require('http');
 const url = require('url');
+const { Pool } = require('pg');
 
 // ---------- ENV ----------
 const PORT = process.env.PORT || 3000;
@@ -19,29 +21,43 @@ const BASES = {
 };
 const BASE = BASES[PLAID_ENV] || BASES.production;
 
-// Products
+// Preferred Plaid products
 const VALID_PRODUCTS = new Set([
   'auth','transactions','identity','assets','investments',
   'liabilities','income','payment_initiation','transfer','signal','credit_details'
 ]);
 const PREFERRED_PRODUCTS = ['transactions','auth','identity','liabilities','investments'];
 
-// AI keys — support BOTH naming styles
-const OPENAI_API_KEY     = process.env.OPENAI_API_KEY || process.env.OPEN_API_KEY || '';
-const OPENAI_MODEL       = process.env.OPENAI_MODEL   || 'gpt-4o-mini';
-
-const ANTHROPIC_API_KEY  = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || '';
-const ANTHROPIC_MODEL    = process.env.ANTHROPIC_MODEL   || 'claude-3-haiku-20240307';
-
-const GEMINI_API_KEY     = process.env.GEMINI_API_KEY || '';
-const GEMINI_MODEL       = process.env.GEMINI_MODEL   || 'gemini-1.5-flash';
+// AI Keys (accept multiple forms)
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPEN_API_KEY || '';
+const OPENAI_MODEL   = process.env.OPENAI_MODEL   || 'gpt-4o-mini';
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || '';
+const ANTHROPIC_MODEL   = process.env.ANTHROPIC_MODEL   || 'claude-3-haiku-20240307';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL   = process.env.GEMINI_MODEL   || 'gemini-1.5-flash';
 
 // Optional: webhook + redirect
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 const PLAID_REDIRECT_URI = process.env.PLAID_REDIRECT_URI || '';
 
-// ---------- Simple in-memory token store (userId -> access_token) ----------
-const tokens = new Map();
+// ---------- Database (persistent token storage) ----------
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+async function dbInit() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tokens (
+      id SERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      access_token TEXT NOT NULL,
+      item_id TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+}
+dbInit();
 
 // ---------- Helpers ----------
 function cors(res) {
@@ -61,8 +77,12 @@ function readJSON(req) {
     req.on('end', () => { try { resolve(JSON.parse(data || '{}')); } catch { resolve({}); } });
   });
 }
+function daysAgo(n) {
+  const d = new Date(Date.now() - n*24*3600*1000);
+  return d.toISOString().slice(0,10);
+}
 
-// Hard timeout wrapper (avoid Heroku H12)
+// ---- Timeout wrapper ----
 function fetchWithTimeout(resource, options = {}, ms = 12000) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), ms);
@@ -70,104 +90,48 @@ function fetchWithTimeout(resource, options = {}, ms = 12000) {
     .finally(() => clearTimeout(t));
 }
 
+// ---- Plaid POST ----
 async function plaidPost(path, body) {
-  const started = Date.now();
-  try {
-    const r = await fetchWithTimeout(`${BASE}${path}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'PLAID-CLIENT-ID': PLAID_CLIENT_ID,
-        'PLAID-SECRET': PLAID_SECRET,
-      },
-      body: JSON.stringify(body),
-    }, 12000);
+  const r = await fetchWithTimeout(`${BASE}${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'PLAID-CLIENT-ID': PLAID_CLIENT_ID,
+      'PLAID-SECRET': PLAID_SECRET,
+    },
+    body: JSON.stringify(body),
+  }, 12000);
 
-    const text = await r.text();
-    let data;
-    try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
-    if (!r.ok) {
-      const err = data || {};
-      err.http_status = r.status;
-      err.ms = Date.now() - started;
-      throw err;
-    }
-    return data;
-  } catch (e) {
-    const isAbort = (e && (e.name === 'AbortError' || e.message === 'The operation was aborted'));
-    const out = {
-      error: isAbort ? 'UPSTREAM_TIMEOUT' : (e?.error_code || e?.error || 'PLAID_ERROR'),
-      details: e,
-      ms: Date.now() - started,
-      path,
-    };
-    console.error('plaidPost fail:', out);
-    throw out;
+  const text = await r.text();
+  let data;
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+  if (!r.ok) {
+    const err = data || {};
+    err.http_status = r.status;
+    throw err;
   }
+  return data;
 }
 
-function cleanProducts(list) {
-  return (list || PREFERRED_PRODUCTS)
-    .map(s => String(s).trim().toLowerCase())
-    .filter(p => VALID_PRODUCTS.has(p));
+// ---- Persistent Token Storage ----
+async function saveToken(userId, accessToken, itemId) {
+  await pool.query(
+    `INSERT INTO tokens (user_id, access_token, item_id) VALUES ($1,$2,$3)`,
+    [userId, accessToken, itemId]
+  );
 }
-function parseInvalidProducts(err) {
-  const m = (err?.error_message || '').match(/\[([^\]]+)\]/);
-  if (!m) return [];
-  return m[1].split(',').map(s => s.trim().toLowerCase());
+async function getToken(userId) {
+  const { rows } = await pool.query(
+    `SELECT access_token FROM tokens WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1`,
+    [userId]
+  );
+  return rows[0]?.access_token || null;
 }
-
-async function linkTokenCreateSmart(baseReq, prods) {
-  let products = cleanProducts(prods);
-  if (products.length === 0) products = ['transactions'];
-  let attempts = 0;
-  while (products.length && attempts < 4) {
-    attempts++;
-    try {
-      const body = { ...baseReq, products };
-      const out = await plaidPost('/link/token/create', body);
-      return { ...out, products_used: products };
-    } catch (e) {
-      const code = e?.error_code || e?.error || '';
-      if (code === 'INVALID_PRODUCT') {
-        const bad = new Set(parseInvalidProducts(e));
-        products = products.filter(p => !bad.has(p));
-        if (!products.length) break;
-        continue;
-      }
-      if (code === 'PRODUCTS_NOT_SUPPORTED' || code === 'PRODUCTS_NOT_ENABLED') {
-        products = ['transactions','auth'].filter(p => products.includes(p));
-        if (!products.length) products = ['transactions'];
-        continue;
-      }
-      throw e;
-    }
-  }
-  const out = await plaidPost('/link/token/create', { ...baseReq, products: ['transactions'] });
-  return { ...out, products_used: ['transactions'] };
+async function deleteToken(userId) {
+  await pool.query(`DELETE FROM tokens WHERE user_id=$1`, [userId]);
 }
 
-function needToken(res, userId) {
-  const token = tokens.get(userId);
-  if (!token) json(res, 401, { error: 'NO_LINKED_ITEM_FOR_USER' });
-  return token;
-}
-function safePlaid(res, fn) {
-  return fn().catch(err => {
-    console.error('Plaid error:', err);
-    const code = err?.error || err?.error_code || 'PLAID_ERROR';
-    const status = (err?.http_status >= 400 && err?.http_status <= 599) ? err.http_status : 500;
-    json(res, status, { error: code, details: err });
-  });
-}
-function daysAgo(n) {
-  const d = new Date(Date.now() - n*24*3600*1000);
-  return d.toISOString().slice(0,10);
-}
-function sum(arr) { return (arr||[]).reduce((a,b)=>a+(+b||0),0); }
-function money(n) { return Math.round((+n||0)*100)/100; }
-
-// ---------- Plaid helpers ----------
+// ---- Plaid Helpers ----
 async function getAccounts(token) {
   try { return await plaidPost('/accounts/balance/get', { access_token: token }); }
   catch { return null; }
@@ -187,10 +151,12 @@ async function getTransactions(token, start, end) {
     });
   } catch { return null; }
 }
+function sum(arr) { return (arr||[]).reduce((a,b)=>a+(+b||0),0); }
+function money(n) { return Math.round((+n||0)*100)/100; }
 
-// ---------- KPI Summary (with Emergency→Savings & loan account fallback) ----------
+// ---- Build KPI Summary ----
 async function buildSummary(userId='default') {
-  const access = tokens.get(userId);
+  const access = await getToken(userId);
   if (!access) return { linked:false };
 
   const [acc, liab, inv, tx] = await Promise.all([
@@ -200,445 +166,132 @@ async function buildSummary(userId='default') {
     getTransactions(access, daysAgo(30), daysAgo(0)),
   ]);
 
-  const accounts = (acc && acc.accounts) || [];
-  const isEmergencyName = (name='') => /emergency/i.test(name);
-
-  // Cash buckets
+  let accounts = (acc && acc.accounts) || [];
   const cashAccts = accounts.filter(a => a.type === 'depository');
-  const bySub = (sub) => cashAccts.filter(a => a.subtype === sub)
-    .map(a => a.balances?.available ?? a.balances?.current ?? 0);
+  const checking = money(sum(cashAccts.filter(a=>a.subtype==='checking').map(a=>a.balances?.available ?? 0)));
+  const savings  = money(sum(cashAccts.filter(a=>a.subtype==='savings').map(a=>a.balances?.available ?? 0)));
+  const cashOther= money(sum(cashAccts.filter(a=>!['checking','savings'].includes(a.subtype)).map(a=>a.balances?.available ?? 0)));
+  const totalCash= money(checking+savings+cashOther);
 
-  // Treat "Emergency Fund" like savings
-  const emergAsSavings = accounts
-    .filter(a => a.type === 'depository' && isEmergencyName(a.name || a.official_name || ''))
-    .map(a => a.balances?.available ?? a.balances?.current ?? 0);
-
-  const checking = money(sum(bySub('checking')));
-  const savings  = money(sum(bySub('savings')) + sum(emergAsSavings));
-  const otherCash= money(sum(
-      cashAccts
-        .filter(a => a.subtype !== 'checking' && a.subtype !== 'savings' && !isEmergencyName(a.name || a.official_name || ''))
-        .map(a => a.balances?.available ?? a.balances?.current ?? 0)
-    ));
-  const totalCash= money(checking + savings + otherCash);
-
-  // Liabilities (use /liabilities when present; also fall back to loan-type accounts)
   let totalLiabilities = 0;
   if (liab && liab.liabilities) {
     const L = liab.liabilities;
-    const cc  = (L.credit || []).map(x => x.balance?.current ?? 0);
-    const stu = (L.student ?? []).map(x => x.outstanding_balance ?? 0);
-    const mort= (L.mortgage ?? []).map(x => x.principal_balance ?? 0);
-    const auto= (L.auto ?? []).map(x => x.outstanding_balance ?? 0);
-    totalLiabilities = money(sum(cc) + sum(stu) + sum(mort) + sum(auto));
+    totalLiabilities = money(
+      sum((L.credit||[]).map(x=>x.balance?.current ?? 0)) +
+      sum((L.student||[]).map(x=>x.outstanding_balance ?? 0)) +
+      sum((L.mortgage||[]).map(x=>x.principal_balance ?? 0)) +
+      sum((L.auto||[]).map(x=>x.outstanding_balance ?? 0))
+    );
   }
-  // Fallback: some personal loans appear as accounts of type "loan"
-  const loanAccountsBalance = sum(
-    accounts
-      .filter(a => a.type === 'loan' || a.subtype === 'loan')
-      .map(a => a.balances?.current ?? 0)
-  );
-  totalLiabilities = money(totalLiabilities + loanAccountsBalance);
 
-  // Investments (total)
   let totalInvestments = 0;
   if (inv && inv.holdings && inv.securities) {
-    const holdings = inv.holdings;
     const secMap = new Map();
-    inv.securities.forEach(s => secMap.set(s.security_id, s));
-    totalInvestments = money(sum(holdings.map(h => {
-      if (typeof h.institution_value === 'number') return h.institution_value;
-      const sec = secMap.get(h.security_id);
-      const px = (sec && (sec.close_price ?? sec.price)) || 0;
-      return (+h.quantity || 0) * (+px || 0);
+    inv.securities.forEach(s=>secMap.set(s.security_id,s));
+    totalInvestments = money(sum(inv.holdings.map(h=>{
+      if(typeof h.institution_value==='number') return h.institution_value;
+      const sec=secMap.get(h.security_id);
+      const px=(sec && (sec.close_price??sec.price))||0;
+      return (+h.quantity||0)*(+px||0);
     })));
   }
 
-  // Transactions KPIs
-  let income30 = 0, spend30 = 0, netCashFlow = 0, monthlySpend = 0, savingsRate = 0;
-  if (tx && tx.transactions) {
-    const t = tx.transactions;
-    income30 = money(sum(t.filter(x => x.amount < 0).map(x => -x.amount)));
-    spend30  = money(sum(t.filter(x => x.amount > 0).map(x => x.amount)));
-    if (income30 < spend30 && sum(t.map(x=>x.amount)) < 0) {
-      income30 = money(sum(t.filter(x => x.amount > 0).map(x => x.amount)));
-      spend30  = money(sum(t.filter(x => x.amount < 0).map(x => -x.amount)));
+  let income30=0,spend30=0,netCashFlow=0,monthlySpend=0,savingsRate=0;
+  if(tx && tx.transactions){
+    const t=tx.transactions;
+    income30 = money(sum(t.filter(x=>x.amount<0).map(x=>-x.amount)));
+    spend30  = money(sum(t.filter(x=>x.amount>0).map(x=>x.amount)));
+    if(income30<spend30 && sum(t.map(x=>x.amount))<0){
+      income30 = money(sum(t.filter(x=>x.amount>0).map(x=>x.amount)));
+      spend30  = money(sum(t.filter(x=>x.amount<0).map(x=>-x.amount)));
     }
-    netCashFlow = money(income30 - spend30);
-    monthlySpend = spend30 || 2000;
-    savingsRate = income30 ? Math.max(0, Math.min(1, netCashFlow / income30)) : 0;
-  } else {
-    monthlySpend = 2000; savingsRate = 0.20; netCashFlow = 0;
+    netCashFlow=money(income30-spend30);
+    monthlySpend=spend30||2000;
+    savingsRate=income30?Math.max(0,Math.min(1,netCashFlow/income30)):0;
   }
 
-  const runwayMonths = monthlySpend ? money(totalCash / monthlySpend) : 0;
-  const netWorth = money(totalCash + totalInvestments - totalLiabilities);
+  const runwayMonths = monthlySpend?money(totalCash/monthlySpend):0;
+  const netWorth = money(totalCash+totalInvestments-totalLiabilities);
 
   return {
-    linked: true,
+    linked:true,
     userId,
-    accounts: accounts.map(a => ({
-      account_id: a.account_id,
-      name: a.name || a.official_name || 'Account',
-      mask: a.mask || '',
-      type: a.type,
-      subtype: a.subtype,
-      available: a.balances?.available ?? null,
-      current: a.balances?.current ?? null,
-      currency: a.balances?.iso_currency_code || a.balances?.unofficial_currency_code || 'USD'
+    accounts: accounts.map(a=>({
+      account_id:a.account_id,
+      name:a.name||a.official_name||'Account',
+      mask:a.mask||'',
+      type:a.type,
+      subtype:a.subtype,
+      available:a.balances?.available??null,
+      current:a.balances?.current??null,
+      currency:a.balances?.iso_currency_code||'USD'
     })),
-    kpis: {
-      netWorth, totalCash, checking, savings, cashOther: otherCash,
-      totalInvestments, totalLiabilities,
-      income30, spend30, netCashFlow, monthlySpend, savingsRate, runwayMonths
-    }
+    kpis:{netWorth,totalCash,checking,savings,cashOther,totalInvestments,totalLiabilities,
+      income30,spend30,netCashFlow,monthlySpend,savingsRate,runwayMonths}
   };
 }
 
-// ---------- AI ----------
-function withTimeout(promise, ms=14000) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => setTimeout(()=>reject(new Error('TIMEOUT')), ms))
-  ]);
-}
-
-async function askOpenAI(prompt, system) {
-  if (!OPENAI_API_KEY) return null;
-  try {
-    const r = await withTimeout(fetch('https://api.openai.com/v1/chat/completions', {
-      method:'POST',
-      headers:{
-        'Authorization':`Bearer ${OPENAI_API_KEY}`,
-        'Content-Type':'application/json'
-      },
-      body: JSON.stringify({
-        model: OPENAI_MODEL,
-        temperature: 0.3,
-        messages: [
-          { role:'system', content: system },
-          { role:'user', content: prompt }
-        ]
-      })
-    }));
-    const j = await r.json();
-    const text = j?.choices?.[0]?.message?.content?.trim();
-    return text || null;
-  } catch { return null; }
-}
-
-async function askAnthropic(prompt, system) {
-  if (!ANTHROPIC_API_KEY) return null;
-  try {
-    const r = await withTimeout(fetch('https://api.anthropic.com/v1/messages', {
-      method:'POST',
-      headers:{
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-        'Content-Type':'application/json'
-      },
-      body: JSON.stringify({
-        model: ANTHROPIC_MODEL,
-        max_tokens: 1024,
-        system,
-        messages: [{ role:'user', content:[{ type:'text', text: prompt }] }]
-      })
-    }));
-    const j = await r.json();
-    const text = j?.content?.[0]?.text?.trim();
-    return text || null;
-  } catch { return null; }
-}
-
-async function askGemini(prompt, system) {
-  if (!GEMINI_API_KEY) return null;
-  try {
-    const r = await withTimeout(fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
-      method:'POST',
-      headers:{ 'Content-Type':'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: `${system}\n\n${prompt}` }]}],
-        generationConfig: { temperature: 0.3, maxOutputTokens: 1024 }
-      })
-    }));
-    const j = await r.json();
-    const text = j?.candidates?.[0]?.content?.parts?.map(p=>p.text).join(' ').trim();
-    return text || null;
-  } catch { return null; }
-}
-
-function fuseReplies(replies) {
-  const texts = replies.filter(Boolean).map(s => String(s).trim()).filter(Boolean);
-  if (!texts.length) return "I'm ready, but no AI providers responded. Check your AI keys.";
-  const first = texts[0];
-  const seen = new Set(first.split(/(?<=\.)\s+/).map(s=>s.trim().toLowerCase()));
-  let extra = [];
-  for (let i=1;i<texts.length;i++){
-    const parts = texts[i].split(/(?<=\.)\s+/);
-    for (const p of parts){
-      const k = p.trim().toLowerCase();
-      if (k && !seen.has(k)) { extra.push(p.trim()); if (extra.length>=3) break; }
-    }
-    if (extra.length>=3) break;
-  }
-  return [first, ...extra].join(' ');
-}
-
 // ---------- HTTP Server ----------
-const server = http.createServer(async (req, res) => {
+const server = http.createServer(async (req,res)=>{
   cors(res);
-  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
-
-  const parsed = url.parse(req.url, true);
-  const path = parsed.pathname;
+  if(req.method==='OPTIONS'){res.writeHead(204);return res.end();}
+  const parsed=url.parse(req.url,true);
+  const path=parsed.pathname;
 
   try {
-    if (req.method === 'GET' && path === '/') {
-      return json(res, 200, { ok:true, env: PLAID_ENV, countries: COUNTRY_CODES });
-    }
-    if (req.method === 'GET' && path === '/ping') {
-      return json(res, 200, { ok:true, env: PLAID_ENV });
+    // Health
+    if(req.method==='GET'&&path==='/'){return json(res,200,{ok:true,env:PLAID_ENV});}
+    if(req.method==='GET'&&path==='/ping'){return json(res,200,{ok:true});}
+
+    // Create Link Token
+    if(req.method==='POST'&&path==='/plaid/link_token/create'){
+      const body=await readJSON(req);
+      const userId=body.userId||'default';
+      const baseReq={user:{client_user_id:userId},client_name:'ACTIV',language:'en',country_codes:COUNTRY_CODES};
+      if(PLAID_REDIRECT_URI) baseReq.redirect_uri=PLAID_REDIRECT_URI;
+      if(WEBHOOK_URL) baseReq.webhook=WEBHOOK_URL;
+      const data=await plaidPost('/link/token/create',{...baseReq,products:PREFERRED_PRODUCTS});
+      return json(res,200,{link_token:data.link_token,expiration:data.expiration,userId});
     }
 
-    // --- Link create
-    if (req.method === 'POST' && path === '/plaid/link_token/create') {
-      const body = await readJSON(req);
-      const userId = body.userId || body.user_id || 'default';
-      const baseReq = {
-        user: { client_user_id: userId },
-        client_name: 'ACTIV',
-        language: 'en',
-        country_codes: COUNTRY_CODES,
-      };
-      if (PLAID_REDIRECT_URI) baseReq.redirect_uri = PLAID_REDIRECT_URI;
-      if (WEBHOOK_URL) baseReq.webhook = WEBHOOK_URL;
-
-      return safePlaid(res, async () => {
-        const data = await linkTokenCreateSmart(baseReq, body.products || PREFERRED_PRODUCTS);
-        json(res, 200, {
-          link_token: data.link_token,
-          expiration: data.expiration,
-          userId,
-          products_used: data.products_used
-        });
-      });
+    // Exchange public_token
+    if(req.method==='POST'&&path==='/plaid/exchange_public_token'){
+      const body=await readJSON(req);
+      if(!body.public_token) return json(res,400,{error:'MISSING_PUBLIC_TOKEN'});
+      const userId=body.userId||'default';
+      const data=await plaidPost('/item/public_token/exchange',{public_token:body.public_token});
+      await saveToken(userId,data.access_token,data.item_id);
+      return json(res,200,{item_id:data.item_id,stored_for_user:userId});
     }
 
-    // --- Link update (add investments to current Item)
-    if (req.method === 'POST' && path === '/plaid/link_token/update') {
-      const body = await readJSON(req);
-      const userId = body.userId || 'default';
-      const access = tokens.get(userId);
-      if (!access) return json(res, 400, { error: 'NO_ACCESS_TOKEN' });
-
-      const cfg = {
-        access_token: access,
-        user: { client_user_id: userId },
-        products: ['investments'],
-        client_name: 'ACTIV Finance',
-        country_codes: COUNTRY_CODES,
-        language: 'en'
-      };
-      if (PLAID_REDIRECT_URI) cfg.redirect_uri = PLAID_REDIRECT_URI;
-
-      return safePlaid(res, async () => {
-        const r = await plaidPost('/link/token/create', cfg);
-        return json(res, 200, { link_token: r.link_token, expiration: r.expiration });
-      });
+    // Accounts
+    if(req.method==='GET'&&path==='/plaid/accounts'){
+      const userId=(parsed.query.userId||'default').toString();
+      const token=await getToken(userId); if(!token) return json(res,401,{error:'NO_LINKED_ITEM_FOR_USER'});
+      const data=await plaidPost('/accounts/balance/get',{access_token:token});
+      return json(res,200,data);
     }
 
-    // --- Exchange
-    if (req.method === 'POST' && path === '/plaid/exchange_public_token') {
-      const body = await readJSON(req);
-      if (!body.public_token) return json(res, 400, { error: 'MISSING_PUBLIC_TOKEN' });
-      const userId = body.userId || 'default';
-      return safePlaid(res, async () => {
-        const data = await plaidPost('/item/public_token/exchange', { public_token: body.public_token });
-        tokens.set(userId, data.access_token);
-        json(res, 200, { item_id: data.item_id, stored_for_user: userId });
-      });
+    // Summary
+    if(req.method==='GET'&&path==='/summary'){
+      const userId=(parsed.query.userId||'default').toString();
+      const s=await buildSummary(userId);
+      return json(res,200,s);
     }
 
-    // --- Data endpoints
-    if (req.method === 'GET' && path === '/plaid/accounts') {
-      const userId = (parsed.query.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
-      return safePlaid(res, async () => {
-        const data = await plaidPost('/accounts/balance/get', { access_token: token });
-        json(res, 200, data);
-      });
-    }
-    if (req.method === 'GET' && path === '/plaid/balances') {
-      const userId = (parsed.query.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
-      return safePlaid(res, async () => {
-        const data = await plaidPost('/accounts/balance/get', { access_token: token });
-        json(res, 200, data);
-      });
-    }
-    if (req.method === 'GET' && path === '/plaid/transactions') {
-      const userId = (parsed.query.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
-      const end = (parsed.query.end || daysAgo(0));
-      const start = (parsed.query.start || daysAgo(30));
-      return safePlaid(res, async () => {
-        const data = await plaidPost('/transactions/get', {
-          access_token: token, start_date: start, end_date: end, options: { count: 250, offset: 0 }
-        });
-        json(res, 200, data);
-      });
-    }
-    if (req.method === 'POST' && path === '/plaid/transactions/sync') {
-      const body = await readJSON(req);
-      const userId = (body.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
-      const cursor = body.cursor || null;
-      return safePlaid(res, async () => {
-        const data = await plaidPost('/transactions/sync', { access_token: token, cursor, count: 500 });
-        json(res, 200, data);
-      });
-    }
-    if (req.method === 'GET' && path === '/plaid/liabilities') {
-      const userId = (parsed.query.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
-      return safePlaid(res, async () => {
-        const data = await plaidPost('/liabilities/get', { access_token: token });
-        json(res, 200, data);
-      });
-    }
-    if (req.method === 'GET' && path === '/plaid/investments/holdings') {
-      const userId = (parsed.query.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
-      return safePlaid(res, async () => {
-        const data = await plaidPost('/investments/holdings/get', { access_token: token });
-        json(res, 200, data);
-      });
-    }
-    if (req.method === 'GET' && path === '/plaid/investments/transactions') {
-      const userId = (parsed.query.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
-      const end = (parsed.query.end || daysAgo(0));
-      const start = (parsed.query.start || daysAgo(90));
-      return safePlaid(res, async () => {
-        const data = await plaidPost('/investments/transactions/get', {
-          access_token: token, start_date: start, end_date: end
-        });
-        json(res, 200, data);
-      });
-    }
-    if (req.method === 'GET' && path === '/plaid/auth') {
-      const userId = (parsed.query.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
-      return safePlaid(res, async () => {
-        const data = await plaidPost('/auth/get', { access_token: token });
-        json(res, 200, data);
-      });
-    }
-    if (req.method === 'GET' && path === '/plaid/identity') {
-      const userId = (parsed.query.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
-      return safePlaid(res, async () => {
-        const data = await plaidPost('/identity/get', { access_token: token });
-        json(res, 200, data);
-      });
-    }
-    if (req.method === 'GET' && path === '/plaid/item') {
-      const userId = (parsed.query.userId || 'default').toString();
-      const token = needToken(res, userId); if (!token) return;
-      return safePlaid(res, async () => {
-        const data = await plaidPost('/item/get', { access_token: token });
-        json(res, 200, data);
-      });
+    // Unlink
+    if(req.method==='POST'&&path==='/plaid/unlink'){
+      const body=await readJSON(req);
+      const userId=body.userId||'default';
+      await deleteToken(userId);
+      return json(res,200,{ok:true});
     }
 
-    // Unlink current Item
-    if (req.method === 'POST' && path === '/plaid/unlink') {
-      const body = await readJSON(req);
-      const userId = (body.userId || 'default').toString();
-      const token = tokens.get(userId);
-      if (!token) return json(res, 200, { ok:true, message:'Nothing to unlink' });
-      return safePlaid(res, async () => {
-        await plaidPost('/item/remove', { access_token: token });
-        tokens.delete(userId);
-        json(res, 200, { ok:true });
-      });
-    }
-
-    // Purge local memory for a user
-    if (req.method === 'POST' && path === '/user/delete') {
-      const body = await readJSON(req);
-      const userId = (body.userId || 'default').toString();
-      tokens.delete(userId);
-      return json(res, 200, { ok:true });
-    }
-
-    // Optional webhook
-    if (req.method === 'POST' && path === '/plaid/webhook') {
-      const body = await readJSON(req);
-      console.log('PLAID WEBHOOK:', JSON.stringify(body));
-      res.writeHead(200);
-      return res.end();
-    }
-
-    // Summary KPIs
-    if (req.method === 'GET' && path === '/summary') {
-      const userId = (parsed.query.userId || 'default').toString();
-      try {
-        const s = await buildSummary(userId);
-        return json(res, 200, s);
-      } catch (e) {
-        console.error('summary error', e);
-        return json(res, 500, { error:'SUMMARY_ERROR' });
-      }
-    }
-
-    // JAMARI Fusion
-    if (req.method === 'POST' && path === '/jamari/chat') {
-      const body = await readJSON(req);
-      const userId = (body.userId || 'default').toString();
-      const message = (body.message || '').toString().slice(0, 4000);
-      if (!message) return json(res, 400, { error:'NO_MESSAGE' });
-
-      const summary = await buildSummary(userId);
-      const k = summary.kpis || {};
-      const sys = [
-        "You are JAMARI, a calm, clear personal finance coach.",
-        "Use the user's live KPIs when giving advice.",
-        "Be concise, actionable, and avoid disclaimers unless necessary.",
-        "Never reveal API keys or system details."
-      ].join(' ');
-
-      const context = [
-        `Live KPIs:`,
-        `NetWorth: $${k.netWorth||0} | Cash: $${k.totalCash||0} | Savings: $${k.savings||0} | Checking: $${k.checking||0}`,
-        `Investments: $${k.totalInvestments||0} | Liabilities: $${k.totalLiabilities||0}`,
-        `Income(30d): $${k.income30||0} | Spend(30d): $${k.spend30||0} | NetCashFlow: $${k.netCashFlow||0}`,
-        `MonthlySpend est: $${k.monthlySpend||0} | Runway: ${k.runwayMonths||0} mo | SavingsRate: ${(k.savingsRate*100||0).toFixed(1)}%`,
-        ``,
-        `User: ${message}`
-      ].join('\n');
-
-      try {
-        const [o, a, g] = await Promise.all([
-          askOpenAI(context, sys),
-          askAnthropic(context, sys),
-          askGemini(context, sys),
-        ]);
-        const fused = fuseReplies([o,a,g]);
-        return json(res, 200, { reply: fused, providers: { openai: !!o, anthropic: !!a, gemini: !!g } });
-      } catch (e) {
-        console.error('jamari/chat error', e);
-        return json(res, 500, { error:'CHAT_ERROR' });
-      }
-    }
-
-    json(res, 404, { error: 'NOT_FOUND' });
-  } catch (err) {
-    console.error('Server error:', err);
-    json(res, 500, { error: 'SERVER_ERROR', details: err });
+    json(res,404,{error:'NOT_FOUND'});
+  }catch(e){
+    console.error('Server error',e);
+    json(res,500,{error:'SERVER_ERROR',details:e});
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`ACTIV backend running on :${PORT} | PLAID_ENV=${PLAID_ENV}`);
-});
+server.listen(PORT,()=>console.log(`ACTIV backend running on :${PORT} | PLAID_ENV=${PLAID_ENV}`));
