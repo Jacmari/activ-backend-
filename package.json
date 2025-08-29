@@ -1,12 +1,15 @@
 {
-  "name": "activ-banking-backend",
+  "name": "activ-backend",
   "version": "1.0.0",
-  "description": "ACTIV Finance backend (Heroku + Plaid + JAMARI AI Fusion)",
+  "description": "ACTIV backend with Plaid + JAMARI AI Fusion + Postgres persistence",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
+  "dependencies": {
+    "pg": "^8.11.3"
+  },
   "engines": {
-    "node": ">=18"
+    "node": ">=18.x"
   }
 }
