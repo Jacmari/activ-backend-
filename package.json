@@ -1,15 +1,13 @@
 {
   "name": "activ-banking-backend",
   "version": "1.0.0",
-  "private": true,
-  "description": "ACTIV backend (Plaid + JAMARI AI) with Postgres token persistence",
+  "description": "ACTIV backend (Plaid + Postgres + JAMARI)",
   "main": "server.js",
-  "type": "commonjs",
   "engines": { "node": ">=18.x" },
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "pg": "^8.11.3"
+    "pg": "^8.11.5"
   }
 }
