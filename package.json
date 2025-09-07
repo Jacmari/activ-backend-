@@ -1,15 +1,28 @@
 {
   "name": "activ-backend",
   "version": "1.0.0",
-  "description": "ACTIV backend with Plaid + JAMARI AI Fusion + Postgres persistence",
+  "description": "ACTIV backend (Plaid + JAMARI AI Fusion + Manual Wealth/Debt + Family). Node 18+, Heroku-ready.",
   "main": "server.js",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
   "dependencies": {
     "pg": "^8.11.3"
   },
-  "engines": {
-    "node": ">=18.x"
-  }
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "keywords": [
+    "plaid",
+    "finance",
+    "jamari",
+    "ai",
+    "backend",
+    "node"
+  ]
 }
